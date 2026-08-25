@@ -3,8 +3,8 @@ import secrets
 from urllib.parse import urlencode
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import RedirectResponse
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import RedirectResponse, HTMLResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
@@ -38,12 +38,90 @@ def root():
         "status": "online",
         "gmail_login": "/auth/google",
         "health": "/health",
+        "privacy": "/privacy",
+        "terms": "/terms",
     }
 
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/privacy", response_class=HTMLResponse)
+def privacy():
+    return """
+    <!doctype html>
+    <html lang="ar" dir="rtl">
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>سياسة الخصوصية - مساعد أمير الشخصي</title>
+    </head>
+    <body style="font-family:Arial;max-width:800px;margin:40px auto;padding:20px;line-height:1.8">
+        <h1>سياسة الخصوصية</h1>
+        <p>مساعد أمير الشخصي هو تطبيق شخصي يستخدم Google OAuth للوصول إلى Gmail بإذن المستخدم.</p>
+
+        <h2>الوصول إلى Gmail</h2>
+        <p>
+        يطلب التطبيق صلاحية قراءة Gmail فقط
+        (gmail.readonly).
+        لا يرسل التطبيق رسائل بريد إلكتروني ولا يحذفها ولا يرد عليها.
+        </p>
+
+        <h2>استخدام البيانات</h2>
+        <p>
+        تُستخدم بيانات البريد فقط لتقديم وظائف المساعد الشخصي مثل
+        قراءة الرسائل وتصنيفها وتلخيصها للمستخدم.
+        </p>
+
+        <h2>مشاركة البيانات</h2>
+        <p>
+        لا يتم بيع بيانات المستخدم أو مشاركتها مع جهات أخرى لأغراض إعلانية.
+        </p>
+
+        <h2>إلغاء الوصول</h2>
+        <p>
+        يمكن للمستخدم إلغاء صلاحية الوصول في أي وقت من إعدادات حساب Google.
+        </p>
+
+        <h2>التواصل</h2>
+        <p>
+        للاستفسارات المتعلقة بالخصوصية، استخدم بريد الدعم المسجل في شاشة موافقة Google.
+        </p>
+    </body>
+    </html>
+    """
+
+
+@app.get("/terms", response_class=HTMLResponse)
+def terms():
+    return """
+    <!doctype html>
+    <html lang="ar" dir="rtl">
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>شروط الاستخدام - مساعد أمير الشخصي</title>
+    </head>
+    <body style="font-family:Arial;max-width:800px;margin:40px auto;padding:20px;line-height:1.8">
+        <h1>شروط الاستخدام</h1>
+        <p>
+        هذا التطبيق مساعد شخصي خاص ويستخدم فقط من قبل المستخدمين المصرح لهم.
+        </p>
+
+        <p>
+        صلاحية Gmail المستخدمة هي للقراءة فقط.
+        لا يقوم التطبيق بإرسال أو حذف أو الرد على رسائل البريد الإلكتروني.
+        </p>
+
+        <p>
+        باستخدام التطبيق، فإنك توافق على منح الصلاحيات التي تظهر لك
+        بوضوح في شاشة موافقة Google.
+        </p>
+    </body>
+    </html>
+    """
 
 
 @app.get("/auth/google")
