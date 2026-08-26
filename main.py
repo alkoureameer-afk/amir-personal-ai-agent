@@ -17,6 +17,7 @@ app = FastAPI(title="مساعد أمير الشخصي")
 
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
+GOOGLE_REFRESH_TOKEN = os.getenv("GOOGLE_REFRESH_TOKEN")
 
 REDIRECT_URI = (
     "https://amir-personal-ai-agent.onrender.com/auth/google/callback"
@@ -89,6 +90,141 @@ def terms():
     """
 
 
+def decode_mime_header(value: str) -> str:
+    if not value:
+        return ""
+
+    try:
+        parts = decode_header(value)
+        result = ""
+
+        for part, encoding in parts:
+            if isinstance(part, bytes):
+                result += part.decode(
+                    encoding or "utf-8",
+                    errors="replace",
+                )
+            else:
+                result += part
+
+        return result
+
+    except Exception:
+        return value
+
+
+def repair_mojibake(text: str) -> str:
+    if not text:
+        return ""
+
+    candidates = [text]
+
+    for source_encoding in ["latin1", "cp1252"]:
+        try:
+            fixed = text.encode(
+                source_encoding,
+                errors="ignore"
+            ).decode(
+                "utf-8",
+                errors="ignore"
+            )
+
+            if fixed:
+                candidates.append(fixed)
+        except Exception:
+            pass
+
+    def score(value: str) -> int:
+        bad = (
+            value.count("Ø")
+            + value.count("Ù")
+            + value.count("Ã")
+            + value.count("â€")
+            + value.count("�")
+        )
+
+        arabic = sum(
+            1
+            for ch in value
+            if "\u0600" <= ch <= "\u06ff"
+        )
+
+        return arabic * 3 - bad * 5
+
+    return max(candidates, key=score)
+
+
+def clean_header(value: str) -> str:
+    return repair_mojibake(
+        decode_mime_header(value)
+    )
+
+
+def get_header(headers: list, name: str) -> str:
+    for header in headers:
+        if header.get("name", "").lower() == name.lower():
+            return clean_header(
+                header.get("value", "")
+            )
+
+    return ""
+
+
+async def refresh_access_token() -> str:
+    refresh_token = (
+        google_tokens.get("refresh_token")
+        or GOOGLE_REFRESH_TOKEN
+    )
+
+    if not refresh_token:
+        raise HTTPException(
+            status_code=401,
+            detail="Connect Gmail first",
+        )
+
+    if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
+        raise HTTPException(
+            status_code=500,
+            detail="Google OAuth is not configured",
+        )
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.post(
+            "https://oauth2.googleapis.com/token",
+            data={
+                "client_id": GOOGLE_CLIENT_ID,
+                "client_secret": GOOGLE_CLIENT_SECRET,
+                "refresh_token": refresh_token,
+                "grant_type": "refresh_token",
+            },
+        )
+
+    if response.status_code != 200:
+        raise HTTPException(
+            status_code=401,
+            detail=response.text,
+        )
+
+    token_data = response.json()
+
+    google_tokens["access_token"] = token_data.get(
+        "access_token"
+    )
+
+    google_tokens["refresh_token"] = refresh_token
+
+    return google_tokens["access_token"]
+
+
+async def get_access_token() -> str:
+    access_token = google_tokens.get("access_token")
+
+    if access_token:
+        return access_token
+
+    return await refresh_access_token()
+
+
 @app.get("/auth/google")
 def google_login():
     if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
@@ -146,64 +282,41 @@ async def google_callback(code: str, state: str):
             detail=response.text,
         )
 
-    google_tokens.update(response.json())
+    token_data = response.json()
+    google_tokens.update(token_data)
 
     return {
         "status": "connected",
         "message": "Gmail connected with read-only access",
+        "refresh_token_received": bool(
+            token_data.get("refresh_token")
+        ),
     }
 
 
 @app.get("/gmail/status")
-def gmail_status():
-    return {
-        "connected": bool(
-            google_tokens.get("access_token")
-        )
-    }
-
-
-def decode_mime_header(value: str) -> str:
-    if not value:
-        return ""
-
+async def gmail_status():
     try:
-        parts = decode_header(value)
-        result = ""
+        await get_access_token()
 
-        for part, encoding in parts:
-            if isinstance(part, bytes):
-                result += part.decode(
-                    encoding or "utf-8",
-                    errors="replace",
-                )
-            else:
-                result += part
+        return {
+            "connected": True,
+            "persistent_refresh_token": bool(
+                GOOGLE_REFRESH_TOKEN
+            ),
+        }
 
-        return result
-
-    except Exception:
-        return value
-
-
-def get_header(headers: list, name: str) -> str:
-    for header in headers:
-        if header.get("name", "").lower() == name.lower():
-            return decode_mime_header(
-                header.get("value", "")
-            )
-
-    return ""
+    except HTTPException:
+        return {
+            "connected": False,
+            "persistent_refresh_token": bool(
+                GOOGLE_REFRESH_TOKEN
+            ),
+        }
 
 
 async def get_gmail_summaries(limit: int = 5):
-    access_token = google_tokens.get("access_token")
-
-    if not access_token:
-        raise HTTPException(
-            status_code=401,
-            detail="Connect Gmail first",
-        )
+    access_token = await get_access_token()
 
     limit = max(1, min(limit, 10))
 
@@ -218,13 +331,29 @@ async def get_gmail_summaries(limit: int = 5):
             params={"maxResults": limit},
         )
 
+        if list_response.status_code == 401:
+            access_token = await refresh_access_token()
+
+            auth_headers = {
+                "Authorization": f"Bearer {access_token}"
+            }
+
+            list_response = await client.get(
+                "https://gmail.googleapis.com/gmail/v1/users/me/messages",
+                headers=auth_headers,
+                params={"maxResults": limit},
+            )
+
         if list_response.status_code != 200:
             raise HTTPException(
                 status_code=list_response.status_code,
                 detail=list_response.text,
             )
 
-        items = list_response.json().get("messages", [])
+        items = list_response.json().get(
+            "messages",
+            [],
+        )
 
         messages = []
 
@@ -249,16 +378,42 @@ async def get_gmail_summaries(limit: int = 5):
                 continue
 
             message_data = message_response.json()
-            payload = message_data.get("payload", {})
-            msg_headers = payload.get("headers", [])
+            payload = message_data.get(
+                "payload",
+                {},
+            )
+
+            msg_headers = payload.get(
+                "headers",
+                [],
+            )
+
+            snippet = repair_mojibake(
+                message_data.get(
+                    "snippet",
+                    "",
+                )
+            )
 
             messages.append({
                 "id": message_id,
-                "from": get_header(msg_headers, "From"),
-                "to": get_header(msg_headers, "To"),
-                "subject": get_header(msg_headers, "Subject"),
-                "date": get_header(msg_headers, "Date"),
-                "snippet": message_data.get("snippet", ""),
+                "from": get_header(
+                    msg_headers,
+                    "From",
+                ),
+                "to": get_header(
+                    msg_headers,
+                    "To",
+                ),
+                "subject": get_header(
+                    msg_headers,
+                    "Subject",
+                ),
+                "date": get_header(
+                    msg_headers,
+                    "Date",
+                ),
+                "snippet": snippet,
             })
 
     return messages
@@ -290,6 +445,8 @@ async def chat(req: ChatRequest):
         "الايميل",
         "الإيميل",
         "بريدي",
+        "لخص رسائلي",
+        "لخّص رسائلي",
     ]
 
     wants_gmail = any(
@@ -322,7 +479,8 @@ async def chat(req: ChatRequest):
 {context}
 
 أجب بالعربية بشكل واضح ومختصر.
-لا تدّعي أنك أرسلت أو حذفت أي رسالة.
+اذكر أهم الرسائل أولاً.
+لا تدّعي إرسال أو حذف أو تعديل أي رسالة.
 """
 
         return {
