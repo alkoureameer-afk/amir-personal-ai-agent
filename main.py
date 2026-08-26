@@ -1,7 +1,4 @@
 import os
-import re
-import html
-import base64
 import secrets
 from email.header import decode_header
 from urllib.parse import urlencode
@@ -38,7 +35,7 @@ class ChatRequest(BaseModel):
 @app.get("/")
 def root():
     return {
-        "name": "مساعد أمير الشخصي",
+        "name": "Amir Personal AI",
         "status": "online",
         "gmail_login": "/auth/google",
         "gmail_status": "/gmail/status",
@@ -66,8 +63,8 @@ def privacy():
     <body style="font-family:Arial;max-width:800px;margin:40px auto;padding:20px;line-height:1.8">
         <h1>سياسة الخصوصية</h1>
         <p>يستخدم التطبيق Google OAuth للوصول إلى Gmail بإذن المستخدم.</p>
-        <p>صلاحية Gmail المستخدمة للقراءة فقط.</p>
-        <p>لا يقوم التطبيق بإرسال أو حذف أو الرد على الرسائل.</p>
+        <p>الوصول إلى Gmail للقراءة فقط.</p>
+        <p>لا يقوم التطبيق بإرسال أو حذف أو تعديل الرسائل.</p>
     </body>
     </html>
     """
@@ -85,7 +82,7 @@ def terms():
     </head>
     <body style="font-family:Arial;max-width:800px;margin:40px auto;padding:20px;line-height:1.8">
         <h1>شروط الاستخدام</h1>
-        <p>هذا التطبيق مساعد شخصي للمستخدمين المصرح لهم فقط.</p>
+        <p>هذا التطبيق مساعد شخصي للمستخدمين المصرح لهم.</p>
         <p>الوصول إلى Gmail للقراءة فقط.</p>
     </body>
     </html>
@@ -113,10 +110,12 @@ def google_login():
         "state": state,
     }
 
-    return RedirectResponse(
+    url = (
         "https://accounts.google.com/o/oauth2/v2/auth?"
         + urlencode(params)
     )
+
+    return RedirectResponse(url)
 
 
 @app.get("/auth/google/callback")
@@ -129,7 +128,7 @@ async def google_callback(code: str, state: str):
 
     pending_states.remove(state)
 
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=30.0) as client:
         response = await client.post(
             "https://oauth2.googleapis.com/token",
             data={
@@ -164,19 +163,6 @@ def gmail_status():
     }
 
 
-def decode_base64url(data: str) -> str:
-    if not data:
-        return ""
-
-    padding = "=" * (-len(data) % 4)
-
-    try:
-        raw = base64.urlsafe_b64decode(data + padding)
-        return raw.decode("utf-8", errors="replace")
-    except Exception:
-        return ""
-
-
 def decode_mime_header(value: str) -> str:
     if not value:
         return ""
@@ -195,25 +181,9 @@ def decode_mime_header(value: str) -> str:
                 result += part
 
         return result
+
     except Exception:
         return value
-
-
-def strip_html(raw_html: str) -> str:
-    if not raw_html:
-        return ""
-
-    text = re.sub(
-        r"(?is)<(script|style).*?>.*?</\\1>",
-        " ",
-        raw_html,
-    )
-
-    text = re.sub(r"(?s)<[^>]+>", " ", text)
-    text = html.unescape(text)
-    text = re.sub(r"\\s+", " ", text)
-
-    return text.strip()
 
 
 def get_header(headers: list, name: str) -> str:
@@ -226,51 +196,7 @@ def get_header(headers: list, name: str) -> str:
     return ""
 
 
-def find_best_body(payload: dict) -> str:
-    mime_type = payload.get("mimeType", "")
-    body = payload.get("body", {})
-    data = body.get("data")
-    parts = payload.get("parts", [])
-
-    if mime_type == "text/plain" and data:
-        return decode_base64url(data)
-
-    plain_candidates = []
-    html_candidates = []
-
-    for part in parts:
-        text = find_best_body(part)
-
-        if not text:
-            continue
-
-        child_type = part.get("mimeType", "")
-
-        if child_type == "text/plain":
-            plain_candidates.append(text)
-        elif child_type == "text/html":
-            html_candidates.append(text)
-        else:
-            plain_candidates.append(text)
-
-    if plain_candidates:
-        return plain_candidates[0]
-
-    if html_candidates:
-        return strip_html(html_candidates[0])
-
-    if data:
-        decoded = decode_base64url(data)
-
-        if mime_type == "text/html":
-            return strip_html(decoded)
-
-        return decoded
-
-    return ""
-
-
-async def get_gmail_messages(limit: int = 5):
+async def get_gmail_summaries(limit: int = 5):
     access_token = google_tokens.get("access_token")
 
     if not access_token:
@@ -279,16 +205,16 @@ async def get_gmail_messages(limit: int = 5):
             detail="Connect Gmail first",
         )
 
-    limit = max(1, min(limit, 20))
+    limit = max(1, min(limit, 10))
 
-    headers = {
+    auth_headers = {
         "Authorization": f"Bearer {access_token}"
     }
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx.AsyncClient(timeout=20.0) as client:
         list_response = await client.get(
             "https://gmail.googleapis.com/gmail/v1/users/me/messages",
-            headers=headers,
+            headers=auth_headers,
             params={"maxResults": limit},
         )
 
@@ -298,10 +224,7 @@ async def get_gmail_messages(limit: int = 5):
                 detail=list_response.text,
             )
 
-        items = list_response.json().get(
-            "messages",
-            [],
-        )
+        items = list_response.json().get("messages", [])
 
         messages = []
 
@@ -310,8 +233,16 @@ async def get_gmail_messages(limit: int = 5):
 
             message_response = await client.get(
                 f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{message_id}",
-                headers=headers,
-                params={"format": "full"},
+                headers=auth_headers,
+                params={
+                    "format": "metadata",
+                    "metadataHeaders": [
+                        "From",
+                        "To",
+                        "Subject",
+                        "Date",
+                    ],
+                },
             )
 
             if message_response.status_code != 200:
@@ -321,32 +252,13 @@ async def get_gmail_messages(limit: int = 5):
             payload = message_data.get("payload", {})
             msg_headers = payload.get("headers", [])
 
-            body = find_best_body(payload)
-            body = strip_html(body)
-
             messages.append({
                 "id": message_id,
-                "from": get_header(
-                    msg_headers,
-                    "From",
-                ),
-                "to": get_header(
-                    msg_headers,
-                    "To",
-                ),
-                "subject": get_header(
-                    msg_headers,
-                    "Subject",
-                ),
-                "date": get_header(
-                    msg_headers,
-                    "Date",
-                ),
-                "snippet": message_data.get(
-                    "snippet",
-                    "",
-                ),
-                "body": body[:2500],
+                "from": get_header(msg_headers, "From"),
+                "to": get_header(msg_headers, "To"),
+                "subject": get_header(msg_headers, "Subject"),
+                "date": get_header(msg_headers, "Date"),
+                "snippet": message_data.get("snippet", ""),
             })
 
     return messages
@@ -354,7 +266,7 @@ async def get_gmail_messages(limit: int = 5):
 
 @app.get("/gmail/messages")
 async def gmail_messages(limit: int = 5):
-    messages = await get_gmail_messages(limit)
+    messages = await get_gmail_summaries(limit)
 
     return {
         "count": len(messages),
@@ -369,26 +281,24 @@ async def chat(req: ChatRequest):
             "error": "OPENAI_API_KEY is not configured"
         }
 
-    text = req.message.strip().lower()
+    text = req.message.lower()
 
-    gmail_keywords = [
-        "رسائلي",
-        "الإيميل",
-        "الايميل",
+    keywords = [
         "gmail",
-        "بريدي",
+        "رسائلي",
         "البريد",
-        "لخص الرسائل",
-        "لخّص الرسائل",
+        "الايميل",
+        "الإيميل",
+        "بريدي",
     ]
 
     wants_gmail = any(
-        keyword in text
-        for keyword in gmail_keywords
+        word in text
+        for word in keywords
     )
 
     if wants_gmail:
-        messages = await get_gmail_messages(5)
+        messages = await get_gmail_summaries(5)
 
         context = "\n\n".join(
             [
@@ -396,24 +306,23 @@ async def chat(req: ChatRequest):
                     f"المرسل: {m['from']}\n"
                     f"العنوان: {m['subject']}\n"
                     f"التاريخ: {m['date']}\n"
-                    f"المحتوى: {m['body'][:1200]}"
+                    f"المقتطف: {m['snippet']}"
                 )
                 for m in messages
             ]
         )
 
         prompt = f"""
-أنت مساعد شخصي باللغة العربية.
+أنت مساعد أمير الشخصي.
 
 طلب المستخدم:
 {req.message}
 
-هذه أحدث رسائل Gmail لديه:
+هذه أحدث رسائل Gmail:
 {context}
 
-أجب باختصار ووضوح.
-إذا طلب تلخيص الرسائل، لخّص أهم ما فيها.
-لا تدّعي إرسال أو حذف أو الرد على أي رسالة.
+أجب بالعربية بشكل واضح ومختصر.
+لا تدّعي أنك أرسلت أو حذفت أي رسالة.
 """
 
         return {
