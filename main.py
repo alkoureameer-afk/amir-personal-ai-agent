@@ -4,8 +4,8 @@ from email.header import decode_header
 from urllib.parse import urlencode
 
 import httpx
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import RedirectResponse, HTMLResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import RedirectResponse, HTMLResponse, PlainTextResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
@@ -19,6 +19,13 @@ GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
 GOOGLE_REFRESH_TOKEN = os.getenv("GOOGLE_REFRESH_TOKEN")
 
+WHATSAPP_ACCESS_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN")
+WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID")
+WHATSAPP_VERIFY_TOKEN = os.getenv(
+    "WHATSAPP_VERIFY_TOKEN",
+    "amir_personal_ai_verify_2026"
+)
+
 REDIRECT_URI = (
     "https://amir-personal-ai-agent.onrender.com/auth/google/callback"
 )
@@ -27,8 +34,6 @@ GMAIL_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
 
 pending_states = set()
 google_tokens = {}
-
-# تخزين مؤقت لعرض Refresh Token مرة واحدة فقط
 one_time_refresh_tokens = {}
 
 
@@ -44,8 +49,8 @@ def root():
         "gmail_login": "/auth/google",
         "gmail_status": "/gmail/status",
         "gmail_messages": "/gmail/messages",
-        "privacy": "/privacy",
-        "terms": "/terms",
+        "whatsapp_webhook": "/whatsapp/webhook",
+        "health": "/health",
     }
 
 
@@ -72,14 +77,9 @@ def privacy():
         line-height:1.8;
     ">
         <h1>سياسة الخصوصية</h1>
-        <p>
-            يستخدم التطبيق Google OAuth للوصول إلى Gmail
-            بإذن المستخدم.
-        </p>
+        <p>يستخدم التطبيق Google OAuth للوصول إلى Gmail بإذن المستخدم.</p>
         <p>الوصول إلى Gmail للقراءة فقط.</p>
-        <p>
-            لا يقوم التطبيق بإرسال أو حذف أو تعديل الرسائل.
-        </p>
+        <p>يستخدم التطبيق WhatsApp Cloud API لاستقبال والرد على الرسائل.</p>
     </body>
     </html>
     """
@@ -103,10 +103,7 @@ def terms():
         line-height:1.8;
     ">
         <h1>شروط الاستخدام</h1>
-        <p>
-            هذا التطبيق مساعد شخصي للمستخدمين المصرح لهم.
-        </p>
-        <p>الوصول إلى Gmail للقراءة فقط.</p>
+        <p>هذا التطبيق مساعد شخصي للمستخدمين المصرح لهم.</p>
     </body>
     </html>
     """
@@ -227,7 +224,6 @@ async def refresh_access_token() -> str:
         )
 
     token_data = response.json()
-
     access_token = token_data.get("access_token")
 
     if not access_token:
@@ -260,7 +256,6 @@ def google_login():
         )
 
     state = secrets.token_urlsafe(32)
-
     pending_states.add(state)
 
     params = {
@@ -313,14 +308,12 @@ async def google_callback(
         )
 
     token_data = response.json()
-
     google_tokens.update(token_data)
 
     refresh_token = token_data.get("refresh_token")
 
     if refresh_token:
         one_time_code = secrets.token_urlsafe(32)
-
         one_time_refresh_tokens[one_time_code] = refresh_token
 
         return RedirectResponse(
@@ -331,10 +324,6 @@ async def google_callback(
         "status": "connected",
         "message": "Gmail connected with read-only access",
         "refresh_token_received": False,
-        "note": (
-            "No new refresh token was returned. "
-            "Try reconnecting with consent."
-        ),
     }
 
 
@@ -354,65 +343,19 @@ def show_refresh_token_once(code: str):
             detail="Token already viewed or invalid",
         )
 
-    # مهم:
-    # هذه الصفحة تعرض الـ Refresh Token مرة واحدة فقط.
-    # لا ترسل صورة لهذه الصفحة لأي شخص.
     return f"""
     <!doctype html>
     <html lang="ar" dir="rtl">
     <head>
         <meta charset="utf-8">
-        <meta
-            name="viewport"
-            content="width=device-width, initial-scale=1"
-        >
+        <meta name="viewport" content="width=device-width, initial-scale=1">
         <title>Google Refresh Token</title>
     </head>
-
-    <body style="
-        font-family:Arial;
-        max-width:800px;
-        margin:40px auto;
-        padding:20px;
-        line-height:1.8;
-    ">
-
+    <body style="font-family:Arial;max-width:800px;margin:40px auto;padding:20px;">
         <h2>تم ربط Gmail بنجاح ✅</h2>
-
-        <p>
-            انسخ القيمة الموجودة في المربع أدناه بنفسك.
-        </p>
-
-        <p>
-            في Render أنشئ متغيرًا باسم:
-        </p>
-
-        <pre>GOOGLE_REFRESH_TOKEN</pre>
-
-        <p>
-            ثم ضع القيمة التالية في VALUE:
-        </p>
-
-        <textarea
-            style="
-                width:100%;
-                height:180px;
-                font-size:16px;
-            "
-            readonly
-        >{refresh_token}</textarea>
-
-        <p>
-            ⚠️ لا ترسل هذه القيمة لأي شخص،
-            ولا تضعها داخل GitHub.
-        </p>
-
-        <p>
-            بعد حفظها في Render،
-            أغلق هذه الصفحة.
-            لن تستطيع مشاهدة القيمة مرة ثانية من نفس الرابط.
-        </p>
-
+        <p>انسخ القيمة التالية إلى Render كـ GOOGLE_REFRESH_TOKEN:</p>
+        <textarea style="width:100%;height:180px;" readonly>{refresh_token}</textarea>
+        <p>لا ترسل هذه القيمة لأي شخص.</p>
     </body>
     </html>
     """
@@ -441,11 +384,7 @@ async def gmail_status():
 
 async def get_gmail_summaries(limit: int = 5):
     access_token = await get_access_token()
-
-    limit = max(
-        1,
-        min(limit, 10),
-    )
+    limit = max(1, min(limit, 10))
 
     auth_headers = {
         "Authorization": f"Bearer {access_token}"
@@ -455,14 +394,11 @@ async def get_gmail_summaries(limit: int = 5):
         list_response = await client.get(
             "https://gmail.googleapis.com/gmail/v1/users/me/messages",
             headers=auth_headers,
-            params={
-                "maxResults": limit,
-            },
+            params={"maxResults": limit},
         )
 
         if list_response.status_code == 401:
             access_token = await refresh_access_token()
-
             auth_headers = {
                 "Authorization": f"Bearer {access_token}"
             }
@@ -470,9 +406,7 @@ async def get_gmail_summaries(limit: int = 5):
             list_response = await client.get(
                 "https://gmail.googleapis.com/gmail/v1/users/me/messages",
                 headers=auth_headers,
-                params={
-                    "maxResults": limit,
-                },
+                params={"maxResults": limit},
             )
 
         if list_response.status_code != 200:
@@ -513,42 +447,19 @@ async def get_gmail_summaries(limit: int = 5):
                 continue
 
             message_data = message_response.json()
-
-            payload = message_data.get(
-                "payload",
-                {},
-            )
-
-            msg_headers = payload.get(
-                "headers",
-                [],
-            )
+            payload = message_data.get("payload", {})
+            msg_headers = payload.get("headers", [])
 
             snippet = repair_mojibake(
-                message_data.get(
-                    "snippet",
-                    "",
-                )
+                message_data.get("snippet", "")
             )
 
             messages.append({
                 "id": message_id,
-                "from": get_header(
-                    msg_headers,
-                    "From",
-                ),
-                "to": get_header(
-                    msg_headers,
-                    "To",
-                ),
-                "subject": get_header(
-                    msg_headers,
-                    "Subject",
-                ),
-                "date": get_header(
-                    msg_headers,
-                    "Date",
-                ),
+                "from": get_header(msg_headers, "From"),
+                "to": get_header(msg_headers, "To"),
+                "subject": get_header(msg_headers, "Subject"),
+                "date": get_header(msg_headers, "Date"),
                 "snippet": snippet,
             })
 
@@ -565,14 +476,8 @@ async def gmail_messages(limit: int = 5):
     }
 
 
-@app.post("/chat")
-async def chat(req: ChatRequest):
-    if not os.getenv("OPENAI_API_KEY"):
-        return {
-            "error": "OPENAI_API_KEY is not configured"
-        }
-
-    text = req.message.lower()
+async def build_agent_reply(user_message: str) -> str:
+    text = user_message.lower()
 
     gmail_keywords = [
         "gmail",
@@ -609,7 +514,7 @@ async def chat(req: ChatRequest):
 أنت مساعد أمير الشخصي.
 
 طلب المستخدم:
-{req.message}
+{user_message}
 
 هذه أحدث رسائل Gmail:
 {context}
@@ -619,15 +524,135 @@ async def chat(req: ChatRequest):
 لا تدّعي إرسال أو حذف أو تعديل أي رسالة.
 """
 
+        return await run_agent(prompt)
+
+    return await run_agent(user_message)
+
+
+@app.post("/chat")
+async def chat(req: ChatRequest):
+    if not os.getenv("OPENAI_API_KEY"):
         return {
-            "reply": await run_agent(prompt)
+            "error": "OPENAI_API_KEY is not configured"
         }
 
     return {
-        "reply": await run_agent(
-            req.message
-        )
+        "reply": await build_agent_reply(req.message)
     }
+
+
+@app.get("/whatsapp/webhook")
+def verify_whatsapp_webhook(
+    hub_mode: str = None,
+    hub_verify_token: str = None,
+    hub_challenge: str = None,
+):
+    if (
+        hub_mode == "subscribe"
+        and hub_verify_token == WHATSAPP_VERIFY_TOKEN
+    ):
+        return PlainTextResponse(
+            content=hub_challenge or "",
+            status_code=200,
+        )
+
+    raise HTTPException(
+        status_code=403,
+        detail="Webhook verification failed",
+    )
+
+
+async def send_whatsapp_message(
+    to_number: str,
+    text: str,
+):
+    if not WHATSAPP_ACCESS_TOKEN:
+        raise HTTPException(
+            status_code=500,
+            detail="WHATSAPP_ACCESS_TOKEN is not configured",
+        )
+
+    if not WHATSAPP_PHONE_NUMBER_ID:
+        raise HTTPException(
+            status_code=500,
+            detail="WHATSAPP_PHONE_NUMBER_ID is not configured",
+        )
+
+    url = (
+        f"https://graph.facebook.com/v21.0/"
+        f"{WHATSAPP_PHONE_NUMBER_ID}/messages"
+    )
+
+    headers = {
+        "Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to_number,
+        "type": "text",
+        "text": {
+            "body": text[:4000]
+        },
+    }
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.post(
+            url,
+            headers=headers,
+            json=payload,
+        )
+
+    if response.status_code >= 300:
+        raise HTTPException(
+            status_code=response.status_code,
+            detail=response.text,
+        )
+
+    return response.json()
+
+
+@app.post("/whatsapp/webhook")
+async def whatsapp_webhook(request: Request):
+    data = await request.json()
+
+    try:
+        entries = data.get("entry", [])
+
+        for entry in entries:
+            changes = entry.get("changes", [])
+
+            for change in changes:
+                value = change.get("value", {})
+                messages = value.get("messages", [])
+
+                for message in messages:
+                    if message.get("type") != "text":
+                        continue
+
+                    from_number = message.get("from")
+                    user_text = (
+                        message
+                        .get("text", {})
+                        .get("body", "")
+                        .strip()
+                    )
+
+                    if not from_number or not user_text:
+                        continue
+
+                    reply = await build_agent_reply(user_text)
+
+                    await send_whatsapp_message(
+                        from_number,
+                        reply,
+                    )
+
+    except Exception as exc:
+        print("WhatsApp webhook error:", exc)
+
+    return {"status": "ok"}
 
 
 if __name__ == "__main__":
