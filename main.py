@@ -1,6 +1,9 @@
 import os
-import secrets
+import re
+import html
 import base64
+import secrets
+from email.header import decode_header
 from urllib.parse import urlencode
 
 import httpx
@@ -38,9 +41,7 @@ def root():
         "name": "مساعد أمير الشخصي",
         "status": "online",
         "gmail_login": "/auth/google",
-        "health": "/health",
         "gmail_status": "/gmail/status",
-        "gmail_inbox": "/gmail/inbox",
         "gmail_messages": "/gmail/messages",
         "privacy": "/privacy",
         "terms": "/terms",
@@ -60,27 +61,13 @@ def privacy():
     <head>
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>سياسة الخصوصية - مساعد أمير الشخصي</title>
+        <title>سياسة الخصوصية</title>
     </head>
     <body style="font-family:Arial;max-width:800px;margin:40px auto;padding:20px;line-height:1.8">
         <h1>سياسة الخصوصية</h1>
-        <p>مساعد أمير الشخصي يستخدم Google OAuth للوصول إلى Gmail بإذن المستخدم.</p>
-
-        <h2>الوصول إلى Gmail</h2>
-        <p>
-        يطلب التطبيق صلاحية قراءة Gmail فقط.
-        لا يرسل رسائل ولا يحذفها ولا يرد عليها.
-        </p>
-
-        <h2>استخدام البيانات</h2>
-        <p>
-        تُستخدم بيانات البريد فقط لقراءة الرسائل وتصنيفها وتلخيصها للمستخدم.
-        </p>
-
-        <h2>مشاركة البيانات</h2>
-        <p>
-        لا يتم بيع بيانات المستخدم أو مشاركتها لأغراض إعلانية.
-        </p>
+        <p>يستخدم التطبيق Google OAuth للوصول إلى Gmail بإذن المستخدم.</p>
+        <p>صلاحية Gmail المستخدمة للقراءة فقط.</p>
+        <p>لا يقوم التطبيق بإرسال أو حذف أو الرد على الرسائل.</p>
     </body>
     </html>
     """
@@ -94,16 +81,12 @@ def terms():
     <head>
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>شروط الاستخدام - مساعد أمير الشخصي</title>
+        <title>شروط الاستخدام</title>
     </head>
     <body style="font-family:Arial;max-width:800px;margin:40px auto;padding:20px;line-height:1.8">
         <h1>شروط الاستخدام</h1>
-        <p>
-        هذا التطبيق مساعد شخصي خاص ويستخدم فقط من قبل المستخدمين المصرح لهم.
-        </p>
-        <p>
-        صلاحية Gmail المستخدمة للقراءة فقط.
-        </p>
+        <p>هذا التطبيق مساعد شخصي للمستخدمين المصرح لهم فقط.</p>
+        <p>الوصول إلى Gmail للقراءة فقط.</p>
     </body>
     </html>
     """
@@ -130,12 +113,10 @@ def google_login():
         "state": state,
     }
 
-    url = (
+    return RedirectResponse(
         "https://accounts.google.com/o/oauth2/v2/auth?"
         + urlencode(params)
     )
-
-    return RedirectResponse(url)
 
 
 @app.get("/auth/google/callback")
@@ -166,8 +147,7 @@ async def google_callback(code: str, state: str):
             detail=response.text,
         )
 
-    token_data = response.json()
-    google_tokens.update(token_data)
+    google_tokens.update(response.json())
 
     return {
         "status": "connected",
@@ -191,43 +171,106 @@ def decode_base64url(data: str) -> str:
     padding = "=" * (-len(data) % 4)
 
     try:
-        decoded = base64.urlsafe_b64decode(data + padding)
-        return decoded.decode("utf-8", errors="replace")
+        raw = base64.urlsafe_b64decode(data + padding)
+        return raw.decode("utf-8", errors="replace")
     except Exception:
         return ""
 
 
-def find_message_body(payload: dict) -> str:
-    mime_type = payload.get("mimeType", "")
-    body = payload.get("body", {})
-    data = body.get("data")
+def decode_mime_header(value: str) -> str:
+    if not value:
+        return ""
 
-    if mime_type == "text/plain" and data:
-        return decode_base64url(data)
+    try:
+        parts = decode_header(value)
+        result = ""
 
-    parts = payload.get("parts", [])
+        for part, encoding in parts:
+            if isinstance(part, bytes):
+                result += part.decode(
+                    encoding or "utf-8",
+                    errors="replace",
+                )
+            else:
+                result += part
 
-    for part in parts:
-        text = find_message_body(part)
-        if text:
-            return text
+        return result
+    except Exception:
+        return value
 
-    if data:
-        return decode_base64url(data)
 
-    return ""
+def strip_html(raw_html: str) -> str:
+    if not raw_html:
+        return ""
+
+    text = re.sub(
+        r"(?is)<(script|style).*?>.*?</\\1>",
+        " ",
+        raw_html,
+    )
+
+    text = re.sub(r"(?s)<[^>]+>", " ", text)
+    text = html.unescape(text)
+    text = re.sub(r"\\s+", " ", text)
+
+    return text.strip()
 
 
 def get_header(headers: list, name: str) -> str:
     for header in headers:
         if header.get("name", "").lower() == name.lower():
-            return header.get("value", "")
+            return decode_mime_header(
+                header.get("value", "")
+            )
 
     return ""
 
 
-@app.get("/gmail/inbox")
-async def gmail_inbox():
+def find_best_body(payload: dict) -> str:
+    mime_type = payload.get("mimeType", "")
+    body = payload.get("body", {})
+    data = body.get("data")
+    parts = payload.get("parts", [])
+
+    if mime_type == "text/plain" and data:
+        return decode_base64url(data)
+
+    plain_candidates = []
+    html_candidates = []
+
+    for part in parts:
+        text = find_best_body(part)
+
+        if not text:
+            continue
+
+        child_type = part.get("mimeType", "")
+
+        if child_type == "text/plain":
+            plain_candidates.append(text)
+        elif child_type == "text/html":
+            html_candidates.append(text)
+        else:
+            plain_candidates.append(text)
+
+    if plain_candidates:
+        return plain_candidates[0]
+
+    if html_candidates:
+        return strip_html(html_candidates[0])
+
+    if data:
+        decoded = decode_base64url(data)
+
+        if mime_type == "text/html":
+            return strip_html(decoded)
+
+        return decoded
+
+    return ""
+
+
+async def get_gmail_messages(limit: int = 5):
     access_token = google_tokens.get("access_token")
 
     if not access_token:
@@ -236,41 +279,7 @@ async def gmail_inbox():
             detail="Connect Gmail first",
         )
 
-    headers = {
-        "Authorization": f"Bearer {access_token}"
-    }
-
-    async with httpx.AsyncClient() as client:
-        response = await client.get(
-            "https://gmail.googleapis.com/gmail/v1/users/me/messages",
-            headers=headers,
-            params={"maxResults": 10},
-        )
-
-    if response.status_code != 200:
-        raise HTTPException(
-            status_code=response.status_code,
-            detail=response.text,
-        )
-
-    return response.json()
-
-
-@app.get("/gmail/messages")
-async def gmail_messages(limit: int = 10):
-    access_token = google_tokens.get("access_token")
-
-    if not access_token:
-        raise HTTPException(
-            status_code=401,
-            detail="Connect Gmail first",
-        )
-
-    if limit < 1:
-        limit = 1
-
-    if limit > 20:
-        limit = 20
+    limit = max(1, min(limit, 20))
 
     headers = {
         "Authorization": f"Bearer {access_token}"
@@ -289,7 +298,10 @@ async def gmail_messages(limit: int = 10):
                 detail=list_response.text,
             )
 
-        items = list_response.json().get("messages", [])
+        items = list_response.json().get(
+            "messages",
+            [],
+        )
 
         messages = []
 
@@ -309,18 +321,40 @@ async def gmail_messages(limit: int = 10):
             payload = message_data.get("payload", {})
             msg_headers = payload.get("headers", [])
 
-            body = find_message_body(payload)
+            body = find_best_body(payload)
+            body = strip_html(body)
 
             messages.append({
                 "id": message_id,
-                "threadId": message_data.get("threadId"),
-                "from": get_header(msg_headers, "From"),
-                "to": get_header(msg_headers, "To"),
-                "subject": get_header(msg_headers, "Subject"),
-                "date": get_header(msg_headers, "Date"),
-                "snippet": message_data.get("snippet", ""),
-                "body": body[:5000],
+                "from": get_header(
+                    msg_headers,
+                    "From",
+                ),
+                "to": get_header(
+                    msg_headers,
+                    "To",
+                ),
+                "subject": get_header(
+                    msg_headers,
+                    "Subject",
+                ),
+                "date": get_header(
+                    msg_headers,
+                    "Date",
+                ),
+                "snippet": message_data.get(
+                    "snippet",
+                    "",
+                ),
+                "body": body[:2500],
             })
+
+    return messages
+
+
+@app.get("/gmail/messages")
+async def gmail_messages(limit: int = 5):
+    messages = await get_gmail_messages(limit)
 
     return {
         "count": len(messages),
@@ -333,6 +367,57 @@ async def chat(req: ChatRequest):
     if not os.getenv("OPENAI_API_KEY"):
         return {
             "error": "OPENAI_API_KEY is not configured"
+        }
+
+    text = req.message.strip().lower()
+
+    gmail_keywords = [
+        "رسائلي",
+        "الإيميل",
+        "الايميل",
+        "gmail",
+        "بريدي",
+        "البريد",
+        "لخص الرسائل",
+        "لخّص الرسائل",
+    ]
+
+    wants_gmail = any(
+        keyword in text
+        for keyword in gmail_keywords
+    )
+
+    if wants_gmail:
+        messages = await get_gmail_messages(5)
+
+        context = "\n\n".join(
+            [
+                (
+                    f"المرسل: {m['from']}\n"
+                    f"العنوان: {m['subject']}\n"
+                    f"التاريخ: {m['date']}\n"
+                    f"المحتوى: {m['body'][:1200]}"
+                )
+                for m in messages
+            ]
+        )
+
+        prompt = f"""
+أنت مساعد شخصي باللغة العربية.
+
+طلب المستخدم:
+{req.message}
+
+هذه أحدث رسائل Gmail لديه:
+{context}
+
+أجب باختصار ووضوح.
+إذا طلب تلخيص الرسائل، لخّص أهم ما فيها.
+لا تدّعي إرسال أو حذف أو الرد على أي رسالة.
+"""
+
+        return {
+            "reply": await run_agent(prompt)
         }
 
     return {
