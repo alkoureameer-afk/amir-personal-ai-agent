@@ -13,7 +13,7 @@ from agent import run_agent
 
 load_dotenv()
 
-app = FastAPI(title="مساعد أمير الشخصي")
+app = FastAPI(title="Amir Personal AI")
 
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
@@ -27,6 +27,9 @@ GMAIL_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
 
 pending_states = set()
 google_tokens = {}
+
+# تخزين مؤقت لعرض Refresh Token مرة واحدة فقط
+one_time_refresh_tokens = {}
 
 
 class ChatRequest(BaseModel):
@@ -61,11 +64,22 @@ def privacy():
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <title>سياسة الخصوصية</title>
     </head>
-    <body style="font-family:Arial;max-width:800px;margin:40px auto;padding:20px;line-height:1.8">
+    <body style="
+        font-family:Arial;
+        max-width:800px;
+        margin:40px auto;
+        padding:20px;
+        line-height:1.8;
+    ">
         <h1>سياسة الخصوصية</h1>
-        <p>يستخدم التطبيق Google OAuth للوصول إلى Gmail بإذن المستخدم.</p>
+        <p>
+            يستخدم التطبيق Google OAuth للوصول إلى Gmail
+            بإذن المستخدم.
+        </p>
         <p>الوصول إلى Gmail للقراءة فقط.</p>
-        <p>لا يقوم التطبيق بإرسال أو حذف أو تعديل الرسائل.</p>
+        <p>
+            لا يقوم التطبيق بإرسال أو حذف أو تعديل الرسائل.
+        </p>
     </body>
     </html>
     """
@@ -81,9 +95,17 @@ def terms():
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <title>شروط الاستخدام</title>
     </head>
-    <body style="font-family:Arial;max-width:800px;margin:40px auto;padding:20px;line-height:1.8">
+    <body style="
+        font-family:Arial;
+        max-width:800px;
+        margin:40px auto;
+        padding:20px;
+        line-height:1.8;
+    ">
         <h1>شروط الاستخدام</h1>
-        <p>هذا التطبيق مساعد شخصي للمستخدمين المصرح لهم.</p>
+        <p>
+            هذا التطبيق مساعد شخصي للمستخدمين المصرح لهم.
+        </p>
         <p>الوصول إلى Gmail للقراءة فقط.</p>
     </body>
     </html>
@@ -121,16 +143,15 @@ def repair_mojibake(text: str) -> str:
 
     for source_encoding in ["latin1", "cp1252"]:
         try:
-            fixed = text.encode(
-                source_encoding,
-                errors="ignore"
-            ).decode(
-                "utf-8",
-                errors="ignore"
+            fixed = (
+                text
+                .encode(source_encoding, errors="ignore")
+                .decode("utf-8", errors="ignore")
             )
 
             if fixed:
                 candidates.append(fixed)
+
         except Exception:
             pass
 
@@ -145,8 +166,8 @@ def repair_mojibake(text: str) -> str:
 
         arabic = sum(
             1
-            for ch in value
-            if "\u0600" <= ch <= "\u06ff"
+            for char in value
+            if "\u0600" <= char <= "\u06ff"
         )
 
         return arabic * 3 - bad * 5
@@ -207,13 +228,18 @@ async def refresh_access_token() -> str:
 
     token_data = response.json()
 
-    google_tokens["access_token"] = token_data.get(
-        "access_token"
-    )
+    access_token = token_data.get("access_token")
 
+    if not access_token:
+        raise HTTPException(
+            status_code=401,
+            detail="Google did not return an access token",
+        )
+
+    google_tokens["access_token"] = access_token
     google_tokens["refresh_token"] = refresh_token
 
-    return google_tokens["access_token"]
+    return access_token
 
 
 async def get_access_token() -> str:
@@ -234,6 +260,7 @@ def google_login():
         )
 
     state = secrets.token_urlsafe(32)
+
     pending_states.add(state)
 
     params = {
@@ -255,7 +282,10 @@ def google_login():
 
 
 @app.get("/auth/google/callback")
-async def google_callback(code: str, state: str):
+async def google_callback(
+    code: str,
+    state: str,
+):
     if state not in pending_states:
         raise HTTPException(
             status_code=400,
@@ -283,15 +313,109 @@ async def google_callback(code: str, state: str):
         )
 
     token_data = response.json()
+
     google_tokens.update(token_data)
+
+    refresh_token = token_data.get("refresh_token")
+
+    if refresh_token:
+        one_time_code = secrets.token_urlsafe(32)
+
+        one_time_refresh_tokens[one_time_code] = refresh_token
+
+        return RedirectResponse(
+            url=f"/auth/google/refresh-token-once?code={one_time_code}"
+        )
 
     return {
         "status": "connected",
         "message": "Gmail connected with read-only access",
-        "refresh_token_received": bool(
-            token_data.get("refresh_token")
+        "refresh_token_received": False,
+        "note": (
+            "No new refresh token was returned. "
+            "Try reconnecting with consent."
         ),
     }
+
+
+@app.get(
+    "/auth/google/refresh-token-once",
+    response_class=HTMLResponse,
+)
+def show_refresh_token_once(code: str):
+    refresh_token = one_time_refresh_tokens.pop(
+        code,
+        None,
+    )
+
+    if not refresh_token:
+        raise HTTPException(
+            status_code=404,
+            detail="Token already viewed or invalid",
+        )
+
+    # مهم:
+    # هذه الصفحة تعرض الـ Refresh Token مرة واحدة فقط.
+    # لا ترسل صورة لهذه الصفحة لأي شخص.
+    return f"""
+    <!doctype html>
+    <html lang="ar" dir="rtl">
+    <head>
+        <meta charset="utf-8">
+        <meta
+            name="viewport"
+            content="width=device-width, initial-scale=1"
+        >
+        <title>Google Refresh Token</title>
+    </head>
+
+    <body style="
+        font-family:Arial;
+        max-width:800px;
+        margin:40px auto;
+        padding:20px;
+        line-height:1.8;
+    ">
+
+        <h2>تم ربط Gmail بنجاح ✅</h2>
+
+        <p>
+            انسخ القيمة الموجودة في المربع أدناه بنفسك.
+        </p>
+
+        <p>
+            في Render أنشئ متغيرًا باسم:
+        </p>
+
+        <pre>GOOGLE_REFRESH_TOKEN</pre>
+
+        <p>
+            ثم ضع القيمة التالية في VALUE:
+        </p>
+
+        <textarea
+            style="
+                width:100%;
+                height:180px;
+                font-size:16px;
+            "
+            readonly
+        >{refresh_token}</textarea>
+
+        <p>
+            ⚠️ لا ترسل هذه القيمة لأي شخص،
+            ولا تضعها داخل GitHub.
+        </p>
+
+        <p>
+            بعد حفظها في Render،
+            أغلق هذه الصفحة.
+            لن تستطيع مشاهدة القيمة مرة ثانية من نفس الرابط.
+        </p>
+
+    </body>
+    </html>
+    """
 
 
 @app.get("/gmail/status")
@@ -318,7 +442,10 @@ async def gmail_status():
 async def get_gmail_summaries(limit: int = 5):
     access_token = await get_access_token()
 
-    limit = max(1, min(limit, 10))
+    limit = max(
+        1,
+        min(limit, 10),
+    )
 
     auth_headers = {
         "Authorization": f"Bearer {access_token}"
@@ -328,7 +455,9 @@ async def get_gmail_summaries(limit: int = 5):
         list_response = await client.get(
             "https://gmail.googleapis.com/gmail/v1/users/me/messages",
             headers=auth_headers,
-            params={"maxResults": limit},
+            params={
+                "maxResults": limit,
+            },
         )
 
         if list_response.status_code == 401:
@@ -341,7 +470,9 @@ async def get_gmail_summaries(limit: int = 5):
             list_response = await client.get(
                 "https://gmail.googleapis.com/gmail/v1/users/me/messages",
                 headers=auth_headers,
-                params={"maxResults": limit},
+                params={
+                    "maxResults": limit,
+                },
             )
 
         if list_response.status_code != 200:
@@ -361,7 +492,11 @@ async def get_gmail_summaries(limit: int = 5):
             message_id = item.get("id")
 
             message_response = await client.get(
-                f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{message_id}",
+                (
+                    "https://gmail.googleapis.com/"
+                    "gmail/v1/users/me/messages/"
+                    f"{message_id}"
+                ),
                 headers=auth_headers,
                 params={
                     "format": "metadata",
@@ -378,6 +513,7 @@ async def get_gmail_summaries(limit: int = 5):
                 continue
 
             message_data = message_response.json()
+
             payload = message_data.get(
                 "payload",
                 {},
@@ -438,7 +574,7 @@ async def chat(req: ChatRequest):
 
     text = req.message.lower()
 
-    keywords = [
+    gmail_keywords = [
         "gmail",
         "رسائلي",
         "البريد",
@@ -450,8 +586,8 @@ async def chat(req: ChatRequest):
     ]
 
     wants_gmail = any(
-        word in text
-        for word in keywords
+        keyword in text
+        for keyword in gmail_keywords
     )
 
     if wants_gmail:
@@ -460,12 +596,12 @@ async def chat(req: ChatRequest):
         context = "\n\n".join(
             [
                 (
-                    f"المرسل: {m['from']}\n"
-                    f"العنوان: {m['subject']}\n"
-                    f"التاريخ: {m['date']}\n"
-                    f"المقتطف: {m['snippet']}"
+                    f"المرسل: {message['from']}\n"
+                    f"العنوان: {message['subject']}\n"
+                    f"التاريخ: {message['date']}\n"
+                    f"المقتطف: {message['snippet']}"
                 )
-                for m in messages
+                for message in messages
             ]
         )
 
@@ -488,7 +624,9 @@ async def chat(req: ChatRequest):
         }
 
     return {
-        "reply": await run_agent(req.message)
+        "reply": await run_agent(
+            req.message
+        )
     }
 
 
@@ -498,5 +636,10 @@ if __name__ == "__main__":
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
-        port=int(os.getenv("PORT", "8000")),
+        port=int(
+            os.getenv(
+                "PORT",
+                "8000",
+            )
+        ),
     )
