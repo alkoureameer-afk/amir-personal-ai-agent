@@ -761,9 +761,15 @@ async def refresh_access_token() -> str:
 
     if response.status_code != 200:
 
+        print(
+            "Google token refresh failed:",
+            response.status_code,
+            response.text,
+        )
+
         raise HTTPException(
             status_code=401,
-            detail=response.text,
+            detail="تعذر تجديد جلسة Gmail",
         )
 
     token_data = response.json()
@@ -935,137 +941,100 @@ async def google_callback(
 
         raise HTTPException(
             status_code=400,
-            detail=response.text,
-        )
-
-    token_data = (
-        response.json()
-    )
-
-    google_tokens.update(
-        token_data
-    )
-
-    refresh_token = (
-        token_data.get(
-            "refresh_token"
-        )
-    )
-
-    if refresh_token:
-
-        one_time_code = (
-            secrets.token_urlsafe(
-                32
-            )
-        )
-
-        one_time_refresh_tokens[
-            one_time_code
-        ] = refresh_token
-
-        return RedirectResponse(
-            url=(
-                "/auth/google/"
-                "refresh-token-once"
-                f"?code={one_time_code}"
-            )
-        )
-
-    return {
-        "status": "connected",
-
-        "message": (
-            "Gmail connected "
-            "with read-only access"
-        ),
-
-        "refresh_token_received": (
-            False
-        ),
-    }
-
-
-@app.get(
-    "/auth/google/refresh-token-once",
-    response_class=HTMLResponse,
-)
-def show_refresh_token_once(
-    code: str,
-):
-
-    refresh_token = (
-        one_time_refresh_tokens
-        .pop(
-            code,
-            None,
-        )
-    )
-
-    if not refresh_token:
-
-        raise HTTPException(
-            status_code=404,
             detail=(
-                "Token already viewed "
-                "or invalid"
+                "Google authorization failed"
             ),
         )
 
-    return f"""
-    <!doctype html>
+    token_data = response.json()
 
-    <html lang="ar" dir="rtl">
+    access_token = token_data.get(
+        "access_token"
+    )
 
-    <head>
+    refresh_token = token_data.get(
+        "refresh_token"
+    )
 
-        <meta charset="utf-8">
+    if access_token:
 
-        <meta
-            name="viewport"
-            content="width=device-width, initial-scale=1"
-        >
+        google_tokens[
+            "access_token"
+        ] = access_token
 
-        <title>
-            Google Refresh Token
-        </title>
+    if refresh_token:
 
-    </head>
+        google_tokens[
+            "refresh_token"
+        ] = refresh_token
 
-    <body style="
-        font-family:Arial;
-        max-width:800px;
-        margin:40px auto;
-        padding:20px;
-    ">
-
-        <h2>
-            تم ربط Gmail بنجاح ✅
-        </h2>
-
-        <p>
-            انسخ القيمة التالية إلى Render
-            كـ GOOGLE_REFRESH_TOKEN:
-        </p>
-
-        <textarea
-            style="width:100%;height:180px;"
-            readonly
-        >{refresh_token}</textarea>
-
-        <p>
-            لا ترسل هذه القيمة لأي شخص.
-        </p>
-
-    </body>
-
-    </html>
-    """
+    return PlainTextResponse(
+        "Gmail connected successfully"
+    )
 
 
 # =========================================================
 # Gmail API
 # =========================================================
+
+async def gmail_request(
+    method: str,
+    url: str,
+    **kwargs,
+):
+
+    access_token = await get_access_token()
+
+    headers = kwargs.pop(
+        "headers",
+        {},
+    )
+
+    headers[
+        "Authorization"
+    ] = (
+        f"Bearer {access_token}"
+    )
+
+    async with httpx.AsyncClient(
+        timeout=30.0
+    ) as client:
+
+        response = await client.request(
+            method,
+            url,
+            headers=headers,
+            **kwargs,
+        )
+
+    if response.status_code == 401:
+
+        google_tokens.pop(
+            "access_token",
+            None,
+        )
+
+        access_token = await refresh_access_token()
+
+        headers[
+            "Authorization"
+        ] = (
+            f"Bearer {access_token}"
+        )
+
+        async with httpx.AsyncClient(
+            timeout=30.0
+        ) as client:
+
+            response = await client.request(
+                method,
+                url,
+                headers=headers,
+                **kwargs,
+            )
+
+    return response
+
 
 @app.get(
     "/gmail/status"
@@ -1074,489 +1043,230 @@ async def gmail_status():
 
     try:
 
-        await get_access_token()
+        response = await gmail_request(
+            "GET",
+            "https://gmail.googleapis.com/gmail/v1/users/me/profile",
+        )
+
+        if response.status_code != 200:
+
+            return {
+                "connected": False,
+                "status_code": response.status_code,
+            }
+
+        data = response.json()
 
         return {
             "connected": True,
-
-            "persistent_refresh_token": bool(
-                GOOGLE_REFRESH_TOKEN
+            "email": data.get(
+                "emailAddress"
             ),
         }
 
-    except HTTPException:
+    except HTTPException as exc:
 
         return {
             "connected": False,
-
-            "persistent_refresh_token": bool(
-                GOOGLE_REFRESH_TOKEN
-            ),
+            "error": exc.detail,
         }
 
+    except Exception as exc:
 
-async def get_gmail_summaries(
-    limit: int = 5,
-):
-
-    access_token = (
-        await get_access_token()
-    )
-
-    limit = max(
-        1,
-        min(
-            limit,
-            10,
-        ),
-    )
-
-    auth_headers = {
-        "Authorization": (
-            f"Bearer {access_token}"
-        )
-    }
-
-    async with httpx.AsyncClient(
-        timeout=20.0
-    ) as client:
-
-        list_response = await client.get(
-            (
-                "https://gmail.googleapis.com/"
-                "gmail/v1/users/me/messages"
-            ),
-
-            headers=auth_headers,
-
-            params={
-                "maxResults": (
-                    limit
-                )
-            },
-        )
-
-        if (
-            list_response.status_code
-            == 401
-        ):
-
-            access_token = (
-                await refresh_access_token()
-            )
-
-            auth_headers = {
-                "Authorization": (
-                    f"Bearer {access_token}"
-                )
-            }
-
-            list_response = (
-                await client.get(
-                    (
-                        "https://gmail.googleapis.com/"
-                        "gmail/v1/users/me/messages"
-                    ),
-
-                    headers=auth_headers,
-
-                    params={
-                        "maxResults": (
-                            limit
-                        )
-                    },
-                )
-            )
-
-        if (
-            list_response.status_code
-            != 200
-        ):
-
-            raise HTTPException(
-                status_code=(
-                    list_response.status_code
-                ),
-
-                detail=(
-                    list_response.text
-                ),
-            )
-
-        items = (
-            list_response
-            .json()
-            .get(
-                "messages",
-                [],
-            )
-        )
-
-        messages = []
-
-        for item in items:
-
-            message_id = item.get(
-                "id"
-            )
-
-            message_response = (
-                await client.get(
-                    (
-                        "https://gmail.googleapis.com/"
-                        "gmail/v1/users/me/messages/"
-                        f"{message_id}"
-                    ),
-
-                    headers=auth_headers,
-
-                    params={
-                        "format": (
-                            "metadata"
-                        ),
-
-                        "metadataHeaders": [
-                            "From",
-                            "To",
-                            "Subject",
-                            "Date",
-                        ],
-                    },
-                )
-            )
-
-            if (
-                message_response.status_code
-                != 200
-            ):
-
-                continue
-
-            message_data = (
-                message_response.json()
-            )
-
-            payload = (
-                message_data.get(
-                    "payload",
-                    {},
-                )
-            )
-
-            msg_headers = (
-                payload.get(
-                    "headers",
-                    [],
-                )
-            )
-
-            snippet = repair_mojibake(
-                message_data.get(
-                    "snippet",
-                    "",
-                )
-            )
-
-            messages.append(
-                {
-                    "id": (
-                        message_id
-                    ),
-
-                    "from": (
-                        get_header(
-                            msg_headers,
-                            "From",
-                        )
-                    ),
-
-                    "to": (
-                        get_header(
-                            msg_headers,
-                            "To",
-                        )
-                    ),
-
-                    "subject": (
-                        get_header(
-                            msg_headers,
-                            "Subject",
-                        )
-                    ),
-
-                    "date": (
-                        get_header(
-                            msg_headers,
-                            "Date",
-                        )
-                    ),
-
-                    "snippet": (
-                        snippet
-                    ),
-                }
-            )
-
-    return messages
+        return {
+            "connected": False,
+            "error": str(exc),
+        }
 
 
 @app.get(
     "/gmail/messages"
 )
 async def gmail_messages(
-    limit: int = 5,
+    max_results: int = 10,
 ):
 
-    messages = (
-        await get_gmail_summaries(
-            limit
-        )
+    max_results = max(
+        1,
+        min(
+            max_results,
+            50,
+        ),
     )
 
-    return {
-        "count": (
-            len(messages)
-        ),
+    response = await gmail_request(
+        "GET",
+        "https://gmail.googleapis.com/gmail/v1/users/me/messages",
+        params={
+            "maxResults": max_results,
+            "q": "newer_than:1d",
+        },
+    )
 
-        "messages": (
-            messages
-        ),
+    if response.status_code != 200:
+
+        raise HTTPException(
+            status_code=response.status_code,
+            detail="Failed to fetch Gmail messages",
+        )
+
+    message_refs = response.json().get(
+        "messages",
+        [],
+    )
+
+    messages = []
+
+    for message_ref in message_refs:
+
+        message_id = message_ref.get(
+            "id"
+        )
+
+        detail_response = await gmail_request(
+            "GET",
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/"
+            + message_id,
+            params={
+                "format": "full",
+            },
+        )
+
+        if detail_response.status_code != 200:
+            continue
+
+        data = detail_response.json()
+
+        payload = data.get(
+            "payload",
+            {},
+        )
+
+        headers = payload.get(
+            "headers",
+            [],
+        )
+
+        messages.append(
+            {
+                "id": message_id,
+                "thread_id": data.get(
+                    "threadId"
+                ),
+                "from": get_header(
+                    headers,
+                    "From",
+                ),
+                "to": get_header(
+                    headers,
+                    "To",
+                ),
+                "subject": get_header(
+                    headers,
+                    "Subject",
+                ),
+                "date": get_header(
+                    headers,
+                    "Date",
+                ),
+                "snippet": data.get(
+                    "snippet",
+                    "",
+                ),
+            }
+        )
+
+    return {
+        "count": len(messages),
+        "messages": messages,
     }
 
 
 # =========================================================
-# AI Agent
-# =========================================================
-
-async def build_agent_reply(
-    user_message: str,
-    user_id: str = "default",
-) -> str:
-
-    text = user_message.lower()
-
-    conversation_context = (
-        await build_conversation_context(
-            user_id
-        )
-    )
-
-    gmail_keywords = [
-        "gmail",
-        "رسائلي",
-        "البريد",
-        "الايميل",
-        "الإيميل",
-        "بريدي",
-        "لخص رسائلي",
-        "لخّص رسائلي",
-    ]
-
-    wants_gmail = any(
-        keyword in text
-        for keyword in gmail_keywords
-    )
-
-    if wants_gmail:
-
-        messages = (
-            await get_gmail_summaries(
-                5
-            )
-        )
-
-        gmail_context = (
-            "\n\n".join(
-                [
-                    (
-                        f"المرسل: {message['from']}\n"
-                        f"العنوان: {message['subject']}\n"
-                        f"التاريخ: {message['date']}\n"
-                        f"المقتطف: {message['snippet']}"
-                    )
-
-                    for message
-                    in messages
-                ]
-            )
-        )
-
-        prompt = f"""
-أنت المساعد الشخصي الذكي لأمير.
-
-لديك ذاكرة دائمة للمحادثات السابقة.
-
-المحادثة السابقة:
-{conversation_context or "لا توجد محادثة سابقة."}
-
-طلب المستخدم الحالي:
-{user_message}
-
-أحدث رسائل Gmail:
-{gmail_context}
-
-أجب بالعربية بشكل واضح وطبيعي.
-
-استخدم المعلومات السابقة عند الحاجة.
-
-لا تدّعي إرسال أو حذف أو تعديل
-رسائل Gmail.
-"""
-
-    else:
-
-        prompt = f"""
-أنت المساعد الشخصي الذكي لأمير.
-
-لديك ذاكرة دائمة للمحادثات.
-
-استخدم المعلومات السابقة
-عن المستخدم عند الحاجة.
-
-المحادثة السابقة:
-{conversation_context or "لا توجد محادثة سابقة."}
-
-رسالة المستخدم الحالية:
-{user_message}
-
-أجب بالعربية بشكل طبيعي وواضح.
-
-إذا سبق أن أخبرك المستخدم باسمه
-أو عمله أو معلومات مهمة عنه،
-استخدم تلك المعلومات عندما يسأل عنها.
-"""
-
-    reply = await run_agent(
-        prompt
-    )
-
-    await save_memory(
-        user_id,
-        "user",
-        user_message,
-    )
-
-    await save_memory(
-        user_id,
-        "assistant",
-        reply,
-    )
-
-    return reply
-
-
-# =========================================================
-# Normal Chat API
+# Chat API
 # =========================================================
 
 @app.post(
     "/chat"
 )
 async def chat(
-    req: ChatRequest,
+    request: ChatRequest,
 ):
 
-    if not os.getenv(
-        "OPENAI_API_KEY"
-    ):
+    user_message = request.message.strip()
 
-        return {
-            "error": (
-                "OPENAI_API_KEY "
-                "is not configured"
-            )
-        }
+    if not user_message:
 
-    reply = await build_agent_reply(
-        req.message,
-        user_id="web-chat",
+        raise HTTPException(
+            status_code=400,
+            detail="Message is required",
+        )
+
+    context = await build_conversation_context(
+        "web-user"
+    )
+
+    prompt = user_message
+
+    if context:
+
+        prompt = (
+            "سجل المحادثة السابق:\n"
+            + context
+            + "\n\nرسالة المستخدم الحالية:\n"
+            + user_message
+        )
+
+    answer = await run_agent(
+        prompt
+    )
+
+    await save_memory(
+        "web-user",
+        "user",
+        user_message,
+    )
+
+    await save_memory(
+        "web-user",
+        "assistant",
+        answer,
     )
 
     return {
-        "reply": reply
+        "reply": answer,
     }
 
 
 # =========================================================
-# WhatsApp Verification
-# =========================================================
-
-@app.get(
-    "/whatsapp/webhook"
-)
-def verify_whatsapp_webhook(
-    hub_mode: str = None,
-    hub_verify_token: str = None,
-    hub_challenge: str = None,
-):
-
-    if (
-        hub_mode == "subscribe"
-        and hub_verify_token
-        == WHATSAPP_VERIFY_TOKEN
-    ):
-
-        return PlainTextResponse(
-            content=(
-                hub_challenge
-                or ""
-            ),
-
-            status_code=200,
-        )
-
-    raise HTTPException(
-        status_code=403,
-
-        detail=(
-            "Webhook verification failed"
-        ),
-    )
-
-
-# =========================================================
-# Send WhatsApp Message
+# WhatsApp
 # =========================================================
 
 async def send_whatsapp_message(
-    to_number: str,
+    to: str,
     text: str,
 ):
 
-    if not WHATSAPP_ACCESS_TOKEN:
+    if (
+        not WHATSAPP_ACCESS_TOKEN
+        or not WHATSAPP_PHONE_NUMBER_ID
+    ):
 
-        raise HTTPException(
-            status_code=500,
-
-            detail=(
-                "WHATSAPP_ACCESS_TOKEN "
-                "is not configured"
-            ),
+        print(
+            "WhatsApp is not configured"
         )
-
-    if not WHATSAPP_PHONE_NUMBER_ID:
-
-        raise HTTPException(
-            status_code=500,
-
-            detail=(
-                "WHATSAPP_PHONE_NUMBER_ID "
-                "is not configured"
-            ),
-        )
+        return
 
     url = (
-        "https://graph.facebook.com/"
-        "v21.0/"
-        f"{WHATSAPP_PHONE_NUMBER_ID}/"
-        "messages"
+        "https://graph.facebook.com/v20.0/"
+        + WHATSAPP_PHONE_NUMBER_ID
+        + "/messages"
     )
 
     headers = {
-
         "Authorization": (
-            f"Bearer "
-            f"{WHATSAPP_ACCESS_TOKEN}"
+            "Bearer "
+            + WHATSAPP_ACCESS_TOKEN
         ),
 
         "Content-Type": (
@@ -1565,23 +1275,11 @@ async def send_whatsapp_message(
     }
 
     payload = {
-
-        "messaging_product": (
-            "whatsapp"
-        ),
-
-        "to": (
-            to_number
-        ),
-
-        "type": (
-            "text"
-        ),
-
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "text",
         "text": {
-            "body": (
-                text[:4000]
-            ),
+            "body": text,
         },
     }
 
@@ -1597,67 +1295,48 @@ async def send_whatsapp_message(
 
     if response.status_code >= 300:
 
-        raise HTTPException(
-            status_code=(
-                response.status_code
-            ),
-
-            detail=(
-                response.text
-            ),
+        print(
+            "WhatsApp send error:",
+            response.status_code,
+            response.text,
         )
 
-    return response.json()
 
-
-# =========================================================
-# WhatsApp Background Processing
-# =========================================================
-
-async def process_whatsapp_message(
-    from_number: str,
-    user_text: str,
-    message_id: str,
+@app.get(
+    "/whatsapp/webhook"
+)
+def verify_whatsapp_webhook(
+    request: Request,
 ):
 
-    try:
+    params = request.query_params
 
-        print(
-            "Processing WhatsApp message:",
-            message_id,
-            "from:",
-            from_number,
+    mode = params.get(
+        "hub.mode"
+    )
+
+    token = params.get(
+        "hub.verify_token"
+    )
+
+    challenge = params.get(
+        "hub.challenge"
+    )
+
+    if (
+        mode == "subscribe"
+        and token == WHATSAPP_VERIFY_TOKEN
+    ):
+
+        return PlainTextResponse(
+            challenge or ""
         )
 
-        reply = (
-            await build_agent_reply(
-                user_text,
-                user_id=from_number,
-            )
-        )
+    raise HTTPException(
+        status_code=403,
+        detail="Verification failed",
+    )
 
-        await send_whatsapp_message(
-            from_number,
-            reply,
-        )
-
-        print(
-            "WhatsApp reply sent successfully:",
-            message_id,
-        )
-
-    except Exception as exc:
-
-        print(
-            "WhatsApp message processing error:",
-            message_id,
-            exc,
-        )
-
-
-# =========================================================
-# Receive WhatsApp
-# =========================================================
 
 @app.post(
     "/whatsapp/webhook"
@@ -1667,11 +1346,11 @@ async def whatsapp_webhook(
     background_tasks: BackgroundTasks,
 ):
 
+    payload = await request.json()
+
     try:
 
-        data = await request.json()
-
-        entries = data.get(
+        entries = payload.get(
             "entry",
             [],
         )
@@ -1695,101 +1374,83 @@ async def whatsapp_webhook(
                     [],
                 )
 
-                if not messages:
-                    continue
-
                 for message in messages:
 
-                    if (
-                        message.get(
-                            "type"
-                        )
-                        != "text"
-                    ):
-                        continue
-
-                    message_id = (
-                        message.get(
-                            "id",
-                            "",
-                        )
+                    message_id = message.get(
+                        "id",
+                        "",
                     )
 
-                    if (
+                    if not remember_whatsapp_message(
                         message_id
-                        and not remember_whatsapp_message(
-                            message_id
-                        )
                     ):
-
-                        print(
-                            "Duplicate WhatsApp message ignored:",
-                            message_id,
-                        )
-
                         continue
 
-                    from_number = (
-                        message.get(
-                            "from"
-                        )
+                    if message.get(
+                        "type"
+                    ) != "text":
+                        continue
+
+                    sender = message.get(
+                        "from",
+                        "",
                     )
 
-                    user_text = (
-                        message
-                        .get(
-                            "text",
-                            {},
-                        )
-                        .get(
-                            "body",
-                            "",
-                        )
-                        .strip()
+                    text = message.get(
+                        "text",
+                        {}
+                    ).get(
+                        "body",
+                        "",
+                    ).strip()
+
+                    if not sender or not text:
+                        continue
+
+                    context = await build_conversation_context(
+                        sender
                     )
 
-                    if not from_number:
-                        continue
+                    prompt = text
 
-                    if not user_text:
-                        continue
+                    if context:
+
+                        prompt = (
+                            "سجل المحادثة السابق:\n"
+                            + context
+                            + "\n\nرسالة المستخدم الحالية:\n"
+                            + text
+                        )
+
+                    answer = await run_agent(
+                        prompt
+                    )
+
+                    await save_memory(
+                        sender,
+                        "user",
+                        text,
+                    )
+
+                    await save_memory(
+                        sender,
+                        "assistant",
+                        answer,
+                    )
 
                     background_tasks.add_task(
-                        process_whatsapp_message,
-                        from_number,
-                        user_text,
-                        message_id,
+                        send_whatsapp_message,
+                        sender,
+                        answer,
                     )
 
     except Exception as exc:
 
         print(
-            "WhatsApp webhook parsing error:",
+            "WhatsApp webhook error:",
             exc,
         )
 
     return {
-        "status": "ok"
+        "status": "received"
     }
-
-
-# =========================================================
-# Run
-# =========================================================
-
-if __name__ == "__main__":
-
-    import uvicorn
-
-    uvicorn.run(
-        "main:app",
-
-        host="0.0.0.0",
-
-        port=int(
-            os.getenv(
-                "PORT",
-                "8000",
-            )
-        ),
-    )
