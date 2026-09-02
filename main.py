@@ -28,7 +28,7 @@ from agent import run_agent
 
 
 # =========================================================
-# Load environment
+# App
 # =========================================================
 
 load_dotenv()
@@ -71,9 +71,14 @@ DATABASE_URL = os.getenv(
     "DATABASE_URL"
 )
 
+RENDER_EXTERNAL_URL = os.getenv(
+    "RENDER_EXTERNAL_URL",
+    "https://amir-personal-ai-agent.onrender.com",
+)
+
 REDIRECT_URI = (
-    "https://amir-personal-ai-agent.onrender.com/"
-    "auth/google/callback"
+    RENDER_EXTERNAL_URL.rstrip("/")
+    + "/auth/google/callback"
 )
 
 GMAIL_SCOPE = (
@@ -83,7 +88,7 @@ GMAIL_SCOPE = (
 
 
 # =========================================================
-# Google temporary memory
+# Google OAuth temporary storage
 # =========================================================
 
 pending_states = set()
@@ -92,7 +97,7 @@ google_tokens = {}
 
 
 # =========================================================
-# Pending WhatsApp outbound messages
+# WhatsApp outbound confirmation memory
 # =========================================================
 
 pending_outbound_messages = {}
@@ -101,6 +106,17 @@ pending_outbound_messages = {}
 def normalize_phone_number(
     phone: str,
 ) -> str:
+
+    """
+    WhatsApp Cloud API expects:
+    country code + number
+    without + or spaces.
+
+    Example:
+    +9705XXXXXXXX
+    becomes:
+    9705XXXXXXXX
+    """
 
     return re.sub(
         r"\D",
@@ -113,58 +129,60 @@ def parse_whatsapp_send_command(
     text: str,
 ):
 
-    text = text.strip()
+    """
+    Supported examples:
 
-    patterns = [
-        (
-            r"^(?:أرسل|ارسل)\s+إلى\s+"
-            r"(\+?\d[\d\s\-]+)\s+"
-            r"(?:رسالة\s*)?[:：]\s*(.+)$"
+    أرسل إلى +9705XXXXXXXX رسالة: مرحبا
+    ارسل الى 9705XXXXXXXX: مرحبا
+    أرسل ل 9705XXXXXXXX مرحبا
+    """
+
+    text = (
+        text
+        or ""
+    ).strip()
+
+    pattern = (
+        r"^(?:أرسل|ارسل)\s+"
+        r"(?:إلى|الى|ل|لـ)\s*"
+        r"(\+?\d{8,15})"
+        r"\s*(?:رسالة)?\s*[:：]?\s*"
+        r"(.+)$"
+    )
+
+    match = re.match(
+        pattern,
+        text,
+        flags=(
+            re.IGNORECASE
+            | re.DOTALL
         ),
+    )
 
-        (
-            r"^(?:أرسل|ارسل)\s+الى\s+"
-            r"(\+?\d[\d\s\-]+)\s+"
-            r"(?:رسالة\s*)?[:：]\s*(.+)$"
-        ),
+    if not match:
 
-        (
-            r"^(?:أرسل|ارسل)\s+ل(?:ـ)?\s*"
-            r"(\+?\d[\d\s\-]+)\s+"
-            r"(?:رسالة\s*)?[:：]?\s*(.+)$"
-        ),
-    ]
+        return None
 
-    for pattern in patterns:
+    phone = normalize_phone_number(
+        match.group(1)
+    )
 
-        match = re.match(
-            pattern,
-            text,
-            flags=(
-                re.IGNORECASE
-                | re.DOTALL
-            ),
-        )
+    message = (
+        match.group(2)
+        .strip()
+    )
 
-        if match:
+    if (
+        not phone
+        or not message
+    ):
 
-            phone = normalize_phone_number(
-                match.group(1)
-            )
+        return None
 
-            message = (
-                match.group(2)
-                .strip()
-            )
-
-            if phone and message:
-
-                return (
-                    phone,
-                    message,
-                )
-
-    return None
+    return (
+        phone,
+        message,
+    )
 
 
 # =========================================================
@@ -219,6 +237,7 @@ async def connect_database():
                 """
                 create index if not exists
                 idx_agent_memory_phone
+
                 on agent_memory (
                     phone_number,
                     created_at desc
@@ -259,7 +278,7 @@ async def shutdown_event():
 
 
 # =========================================================
-# Persistent Conversation Memory
+# Memory
 # =========================================================
 
 MAX_CONVERSATION_MESSAGES = 20
@@ -280,11 +299,6 @@ async def save_memory(
         return
 
     if not db_pool:
-
-        print(
-            "Memory not saved: "
-            "database unavailable"
-        )
 
         return
 
@@ -394,16 +408,10 @@ async def build_conversation_context(
 
     for item in history:
 
-        role = item.get(
-            "role"
-        )
-
-        content = item.get(
-            "content",
-            "",
-        )
-
-        if role == "user":
+        if (
+            item.get("role")
+            == "user"
+        ):
 
             label = "المستخدم"
 
@@ -412,7 +420,8 @@ async def build_conversation_context(
             label = "المساعد"
 
         lines.append(
-            f"{label}: {content}"
+            f"{label}: "
+            f"{item.get('content', '')}"
         )
 
     return "\n".join(
@@ -461,13 +470,13 @@ def remember_whatsapp_message(
         > MAX_PROCESSED_WHATSAPP_MESSAGES
     ):
 
-        oldest_id = (
+        oldest = (
             processed_whatsapp_message_order
             .popleft()
         )
 
         processed_whatsapp_message_ids.discard(
-            oldest_id
+            oldest
         )
 
     return True
@@ -483,7 +492,7 @@ class ChatRequest(BaseModel):
 
 
 # =========================================================
-# Root / Health
+# Root
 # =========================================================
 
 @app.get("/")
@@ -499,25 +508,15 @@ def root():
             else "disconnected"
         ),
 
-        "gmail_login": (
-            "/auth/google"
-        ),
+        "gmail_login": "/auth/google",
 
-        "gmail_status": (
-            "/gmail/status"
-        ),
+        "gmail_status": "/gmail/status",
 
-        "gmail_messages": (
-            "/gmail/messages"
-        ),
+        "gmail_messages": "/gmail/messages",
 
-        "whatsapp_webhook": (
-            "/whatsapp/webhook"
-        ),
+        "whatsapp_webhook": "/whatsapp/webhook",
 
-        "health": (
-            "/health"
-        ),
+        "health": "/health",
     }
 
 
@@ -543,7 +542,7 @@ def health():
 
 
 # =========================================================
-# Privacy
+# Privacy / Terms
 # =========================================================
 
 @app.get(
@@ -558,7 +557,6 @@ def privacy():
     <html lang="ar" dir="rtl">
 
     <head>
-
         <meta charset="utf-8">
 
         <meta
@@ -569,7 +567,6 @@ def privacy():
         <title>
             سياسة الخصوصية
         </title>
-
     </head>
 
     <body style="
@@ -600,7 +597,7 @@ def privacy():
 
         <p>
             قد يتم حفظ سجل المحادثة
-            لتوفير ذاكرة مستمرة للمساعد.
+            لتوفير ذاكرة للمساعد.
         </p>
 
     </body>
@@ -608,10 +605,6 @@ def privacy():
     </html>
     """
 
-
-# =========================================================
-# Terms
-# =========================================================
 
 @app.get(
     "/terms",
@@ -625,7 +618,6 @@ def terms():
     <html lang="ar" dir="rtl">
 
     <head>
-
         <meta charset="utf-8">
 
         <meta
@@ -636,7 +628,6 @@ def terms():
         <title>
             شروط الاستخدام
         </title>
-
     </head>
 
     <body style="
@@ -663,7 +654,7 @@ def terms():
 
 
 # =========================================================
-# Gmail Helpers
+# Gmail helpers
 # =========================================================
 
 def decode_mime_header(
@@ -751,13 +742,12 @@ def repair_mojibake(
 
     def score(
         value: str,
-    ) -> int:
+    ):
 
         bad = (
             value.count("Ø")
             + value.count("Ù")
             + value.count("Ã")
-            + value.count("â€")
             + value.count("�")
         )
 
@@ -835,9 +825,7 @@ async def refresh_access_token() -> str:
 
         raise HTTPException(
             status_code=401,
-            detail=(
-                "Connect Gmail first"
-            ),
+            detail="Connect Gmail first",
         )
 
     if (
@@ -861,21 +849,17 @@ async def refresh_access_token() -> str:
             "https://oauth2.googleapis.com/token",
 
             data={
-                "client_id": (
-                    GOOGLE_CLIENT_ID
-                ),
+                "client_id":
+                    GOOGLE_CLIENT_ID,
 
-                "client_secret": (
-                    GOOGLE_CLIENT_SECRET
-                ),
+                "client_secret":
+                    GOOGLE_CLIENT_SECRET,
 
-                "refresh_token": (
-                    refresh_token
-                ),
+                "refresh_token":
+                    refresh_token,
 
-                "grant_type": (
-                    "refresh_token"
-                ),
+                "grant_type":
+                    "refresh_token",
             },
         )
 
@@ -884,6 +868,7 @@ async def refresh_access_token() -> str:
         print(
             "Google token refresh failed:",
             response.status_code,
+            response.text[:300],
         )
 
         raise HTTPException(
@@ -893,9 +878,9 @@ async def refresh_access_token() -> str:
             ),
         )
 
-    token_data = response.json()
+    data = response.json()
 
-    access_token = token_data.get(
+    access_token = data.get(
         "access_token"
     )
 
@@ -904,8 +889,7 @@ async def refresh_access_token() -> str:
         raise HTTPException(
             status_code=401,
             detail=(
-                "Google did not return "
-                "an access token"
+                "Google access token missing"
             ),
         )
 
@@ -922,32 +906,26 @@ async def refresh_access_token() -> str:
 
 async def get_access_token() -> str:
 
-    access_token = google_tokens.get(
+    token = google_tokens.get(
         "access_token"
     )
 
-    if access_token:
+    if token:
 
-        return access_token
+        return token
 
     return await refresh_access_token()
 
 
-@app.get(
-    "/auth/google"
-)
+@app.get("/auth/google")
 def google_login():
 
-    if (
-        not GOOGLE_CLIENT_ID
-        or not GOOGLE_CLIENT_SECRET
-    ):
+    if not GOOGLE_CLIENT_ID:
 
         raise HTTPException(
             status_code=500,
             detail=(
-                "Google OAuth "
-                "is not configured"
+                "GOOGLE_CLIENT_ID missing"
             ),
         )
 
@@ -960,34 +938,26 @@ def google_login():
     )
 
     params = {
+        "client_id":
+            GOOGLE_CLIENT_ID,
 
-        "client_id": (
-            GOOGLE_CLIENT_ID
-        ),
+        "redirect_uri":
+            REDIRECT_URI,
 
-        "redirect_uri": (
-            REDIRECT_URI
-        ),
+        "response_type":
+            "code",
 
-        "response_type": (
-            "code"
-        ),
+        "scope":
+            GMAIL_SCOPE,
 
-        "scope": (
-            GMAIL_SCOPE
-        ),
+        "access_type":
+            "offline",
 
-        "access_type": (
-            "offline"
-        ),
+        "prompt":
+            "consent",
 
-        "prompt": (
-            "consent"
-        ),
-
-        "state": (
-            state
-        ),
+        "state":
+            state,
     }
 
     url = (
@@ -1035,33 +1005,29 @@ async def google_callback(
             "https://oauth2.googleapis.com/token",
 
             data={
-                "client_id": (
-                    GOOGLE_CLIENT_ID
-                ),
+                "client_id":
+                    GOOGLE_CLIENT_ID,
 
-                "client_secret": (
-                    GOOGLE_CLIENT_SECRET
-                ),
+                "client_secret":
+                    GOOGLE_CLIENT_SECRET,
 
-                "code": (
-                    code
-                ),
+                "code":
+                    code,
 
-                "grant_type": (
-                    "authorization_code"
-                ),
+                "grant_type":
+                    "authorization_code",
 
-                "redirect_uri": (
-                    REDIRECT_URI
-                ),
+                "redirect_uri":
+                    REDIRECT_URI,
             },
         )
 
     if response.status_code != 200:
 
         print(
-            "Google authorization failed:",
+            "Google auth failed:",
             response.status_code,
+            response.text[:300],
         )
 
         raise HTTPException(
@@ -1071,13 +1037,13 @@ async def google_callback(
             ),
         )
 
-    token_data = response.json()
+    data = response.json()
 
-    access_token = token_data.get(
+    access_token = data.get(
         "access_token"
     )
 
-    refresh_token = token_data.get(
+    refresh_token = data.get(
         "refresh_token"
     )
 
@@ -1099,7 +1065,7 @@ async def google_callback(
 
 
 # =========================================================
-# Gmail API Request
+# Gmail request helper
 # =========================================================
 
 async def gmail_request(
@@ -1108,7 +1074,7 @@ async def gmail_request(
     **kwargs,
 ):
 
-    access_token = await get_access_token()
+    token = await get_access_token()
 
     headers = kwargs.pop(
         "headers",
@@ -1118,7 +1084,7 @@ async def gmail_request(
     headers[
         "Authorization"
     ] = (
-        f"Bearer {access_token}"
+        f"Bearer {token}"
     )
 
     async with httpx.AsyncClient(
@@ -1139,14 +1105,14 @@ async def gmail_request(
             None,
         )
 
-        access_token = (
+        token = (
             await refresh_access_token()
         )
 
         headers[
             "Authorization"
         ] = (
-            f"Bearer {access_token}"
+            f"Bearer {token}"
         )
 
         async with httpx.AsyncClient(
@@ -1164,7 +1130,7 @@ async def gmail_request(
 
 
 # =========================================================
-# Gmail Status
+# Gmail status
 # =========================================================
 
 @app.get(
@@ -1187,13 +1153,13 @@ async def gmail_status():
             return {
                 "connected": False,
 
-                "status_code": (
-                    response.status_code
-                ),
+                "status_code":
+                    response.status_code,
 
-                "persistent_refresh_token": bool(
-                    GOOGLE_REFRESH_TOKEN
-                ),
+                "persistent_refresh_token":
+                    bool(
+                        GOOGLE_REFRESH_TOKEN
+                    ),
             }
 
         data = response.json()
@@ -1201,25 +1167,15 @@ async def gmail_status():
         return {
             "connected": True,
 
-            "email": data.get(
-                "emailAddress"
-            ),
+            "email":
+                data.get(
+                    "emailAddress"
+                ),
 
-            "persistent_refresh_token": bool(
-                GOOGLE_REFRESH_TOKEN
-            ),
-        }
-
-    except HTTPException as exc:
-
-        return {
-            "connected": False,
-
-            "error": exc.detail,
-
-            "persistent_refresh_token": bool(
-                GOOGLE_REFRESH_TOKEN
-            ),
+            "persistent_refresh_token":
+                bool(
+                    GOOGLE_REFRESH_TOKEN
+                ),
         }
 
     except Exception as exc:
@@ -1232,18 +1188,15 @@ async def gmail_status():
         return {
             "connected": False,
 
-            "error": (
-                "Gmail status check failed"
-            ),
-
-            "persistent_refresh_token": bool(
-                GOOGLE_REFRESH_TOKEN
-            ),
+            "persistent_refresh_token":
+                bool(
+                    GOOGLE_REFRESH_TOKEN
+                ),
         }
 
 
 # =========================================================
-# Gmail Summaries
+# Gmail messages
 # =========================================================
 
 async def get_gmail_summaries(
@@ -1266,25 +1219,23 @@ async def get_gmail_summaries(
         ),
 
         params={
-            "maxResults": limit,
+            "maxResults":
+                limit,
         },
     )
 
     if response.status_code != 200:
 
-        print(
-            "Gmail list error:",
-            response.status_code,
-        )
-
         raise HTTPException(
-            status_code=response.status_code,
+            status_code=
+                response.status_code,
+
             detail=(
-                "Failed to fetch Gmail messages"
+                "Failed to fetch Gmail"
             ),
         )
 
-    message_refs = (
+    refs = (
         response
         .json()
         .get(
@@ -1295,9 +1246,9 @@ async def get_gmail_summaries(
 
     messages = []
 
-    for message_ref in message_refs:
+    for item in refs:
 
-        message_id = message_ref.get(
+        message_id = item.get(
             "id"
         )
 
@@ -1305,7 +1256,7 @@ async def get_gmail_summaries(
 
             continue
 
-        detail_response = await gmail_request(
+        detail = await gmail_request(
             "GET",
             (
                 "https://gmail.googleapis.com/"
@@ -1314,7 +1265,8 @@ async def get_gmail_summaries(
             ),
 
             params={
-                "format": "metadata",
+                "format":
+                    "metadata",
 
                 "metadataHeaders": [
                     "From",
@@ -1325,14 +1277,11 @@ async def get_gmail_summaries(
             },
         )
 
-        if (
-            detail_response.status_code
-            != 200
-        ):
+        if detail.status_code != 200:
 
             continue
 
-        data = detail_response.json()
+        data = detail.json()
 
         payload = data.get(
             "payload",
@@ -1346,47 +1295,50 @@ async def get_gmail_summaries(
 
         messages.append(
             {
-                "id": message_id,
+                "id":
+                    message_id,
 
-                "thread_id": data.get(
-                    "threadId"
-                ),
-
-                "from": get_header(
-                    headers,
-                    "From",
-                ),
-
-                "to": get_header(
-                    headers,
-                    "To",
-                ),
-
-                "subject": get_header(
-                    headers,
-                    "Subject",
-                ),
-
-                "date": get_header(
-                    headers,
-                    "Date",
-                ),
-
-                "snippet": repair_mojibake(
+                "thread_id":
                     data.get(
-                        "snippet",
-                        "",
-                    )
-                ),
+                        "threadId"
+                    ),
+
+                "from":
+                    get_header(
+                        headers,
+                        "From",
+                    ),
+
+                "to":
+                    get_header(
+                        headers,
+                        "To",
+                    ),
+
+                "subject":
+                    get_header(
+                        headers,
+                        "Subject",
+                    ),
+
+                "date":
+                    get_header(
+                        headers,
+                        "Date",
+                    ),
+
+                "snippet":
+                    repair_mojibake(
+                        data.get(
+                            "snippet",
+                            "",
+                        )
+                    ),
             }
         )
 
     return messages
 
-
-# =========================================================
-# Gmail Messages Endpoint
-# =========================================================
 
 @app.get(
     "/gmail/messages"
@@ -1400,56 +1352,54 @@ async def gmail_messages(
     )
 
     return {
-        "count": len(
-            messages
-        ),
+        "count":
+            len(
+                messages
+            ),
 
-        "messages": messages,
+        "messages":
+            messages,
     }
 
 
 # =========================================================
-# Detect Gmail Requests
+# Gmail detection
 # =========================================================
 
 def is_gmail_request(
-    user_message: str,
+    text: str,
 ) -> bool:
 
     text = (
-        user_message
-        .lower()
-        .strip()
-    )
+        text
+        or ""
+    ).lower()
 
-    gmail_keywords = [
+    keywords = [
         "gmail",
         "جيميل",
         "البريد",
         "بريدي",
         "الايميل",
         "الإيميل",
-        "ايميلي",
-        "إيميلي",
         "رسائلي",
-        "رسائل البريد",
-        "افحص البريد",
         "افحص gmail",
         "افحص جيميل",
-        "اخر رسائلي",
+        "افحص البريد",
         "آخر رسائلي",
+        "اخر رسائلي",
         "لخص رسائلي",
         "لخّص رسائلي",
     ]
 
     return any(
-        keyword in text
-        for keyword in gmail_keywords
+        word in text
+        for word in keywords
     )
 
 
 # =========================================================
-# Send WhatsApp Message
+# Actual WhatsApp send function
 # =========================================================
 
 async def send_whatsapp_message(
@@ -1463,20 +1413,22 @@ async def send_whatsapp_message(
     ):
 
         print(
-            "WhatsApp is not configured"
+            "WhatsApp configuration missing"
         )
+
+        return False
+
+    to = normalize_phone_number(
+        to
+    )
+
+    if not to:
 
         return False
 
     if not text:
 
-        text = (
-            "تعذر إنشاء الرد."
-        )
-
-    to = normalize_phone_number(
-        to
-    )
+        return False
 
     url = (
         "https://graph.facebook.com/v20.0/"
@@ -1485,25 +1437,33 @@ async def send_whatsapp_message(
     )
 
     headers = {
-        "Authorization": (
+        "Authorization":
             "Bearer "
-            + WHATSAPP_ACCESS_TOKEN
-        ),
+            + WHATSAPP_ACCESS_TOKEN,
 
-        "Content-Type": (
-            "application/json"
-        ),
+        "Content-Type":
+            "application/json",
     }
 
     payload = {
-        "messaging_product": "whatsapp",
+        "messaging_product":
+            "whatsapp",
 
-        "to": to,
+        "recipient_type":
+            "individual",
 
-        "type": "text",
+        "to":
+            to,
+
+        "type":
+            "text",
 
         "text": {
-            "body": text[:4000],
+            "preview_url":
+                False,
+
+            "body":
+                text[:4000],
         },
     }
 
@@ -1519,18 +1479,27 @@ async def send_whatsapp_message(
                 json=payload,
             )
 
-        if response.status_code >= 300:
+        if (
+            response.status_code
+            >= 300
+        ):
 
             print(
-                "WhatsApp send error:",
+                "WhatsApp send FAILED:",
                 response.status_code,
-                response.text[:500],
+                response.text[:1000],
             )
 
             return False
 
         print(
-            "WhatsApp reply sent successfully"
+            "WhatsApp message sent:",
+            to,
+        )
+
+        print(
+            "Meta response:",
+            response.text[:500],
         )
 
         return True
@@ -1546,7 +1515,7 @@ async def send_whatsapp_message(
 
 
 # =========================================================
-# Build Agent Reply
+# Build agent reply
 # =========================================================
 
 async def build_agent_reply(
@@ -1554,85 +1523,94 @@ async def build_agent_reply(
     user_id: str = "",
 ) -> str:
 
-    normalized_command = (
+    user_message = (
         user_message
-        .strip()
-        .lower()
+        or ""
+    ).strip()
+
+    normalized_command = (
+        user_message.lower()
     )
 
     # =====================================================
-    # Confirm pending outgoing WhatsApp message
+    # Existing pending outbound message
     # =====================================================
 
-    if normalized_command in [
+    pending = (
+        pending_outbound_messages
+        .get(
+            user_id
+        )
+    )
+
+    confirmation_words = [
         "موافق",
         "وافق",
         "نعم",
-        "نعم أرسل",
         "نعم ارسل",
+        "نعم أرسل",
+        "ارسل",
+        "أرسل",
         "تأكيد",
+        "تاكيد",
         "اكد",
         "أكد",
+        "موافق ارسل",
+        "موافق أرسل",
+        "موافق ارسل الرسالة",
+        "موافق أرسل الرسالة",
+        "نعم ارسلها",
+        "نعم أرسلها",
         "confirm",
-    ]:
+    ]
 
-        pending = pending_outbound_messages.get(
-            user_id
+    is_confirmation = any(
+        (
+            normalized_command
+            == word
+        )
+        or (
+            normalized_command
+            .startswith(
+                word + " "
+            )
+        )
+        for word
+        in confirmation_words
+    )
+
+    # =====================================================
+    # Confirm actual send
+    # =====================================================
+
+    if (
+        pending
+        and is_confirmation
+    ):
+
+        to_number = pending.get(
+            "to"
         )
 
-        if pending:
+        message_text = pending.get(
+            "text"
+        )
 
-            to_number = pending.get(
-                "to"
+        print(
+            "User confirmed outbound message:",
+            user_id,
+            "to:",
+            to_number,
+        )
+
+        success = (
+            await send_whatsapp_message(
+                to_number,
+                message_text,
             )
+        )
 
-            message_text = pending.get(
-                "text"
-            )
-
-            success = (
-                await send_whatsapp_message(
-                    to_number,
-                    message_text,
-                )
-            )
-
-            if success:
-
-                pending_outbound_messages.pop(
-                    user_id,
-                    None,
-                )
-
-                return (
-                    "تم إرسال الرسالة بنجاح ✅\n\n"
-                    f"إلى: {to_number}"
-                )
-
-            return (
-                "تعذر إرسال الرسالة عبر WhatsApp. "
-                "لم يتم حذف طلب الإرسال.\n\n"
-                "اكتب «موافق» للمحاولة مرة أخرى "
-                "أو «إلغاء» لإلغاء العملية."
-            )
-
-    # =====================================================
-    # Cancel pending outgoing WhatsApp message
-    # =====================================================
-
-    if normalized_command in [
-        "إلغاء",
-        "الغاء",
-        "ألغي",
-        "الغي",
-        "إلغي",
-        "cancel",
-    ]:
-
-        if (
-            user_id
-            in pending_outbound_messages
-        ):
+        if success:
 
             pending_outbound_messages.pop(
                 user_id,
@@ -1640,11 +1618,44 @@ async def build_agent_reply(
             )
 
             return (
-                "تم إلغاء إرسال الرسالة ✅"
+                "تم إرسال الرسالة بنجاح ✅\n\n"
+                f"إلى: +{to_number}"
             )
 
         return (
-            "لا توجد رسالة معلقة للإرسال."
+            "حاولت إرسال الرسالة ولكن WhatsApp "
+            "رفض الإرسال ❌\n\n"
+            "لم أحذف الرسالة المعلقة.\n"
+            "يمكنك كتابة «موافق» للمحاولة مرة أخرى "
+            "أو «إلغاء»."
+        )
+
+    # =====================================================
+    # Cancel pending message
+    # =====================================================
+
+    cancel_words = [
+        "إلغاء",
+        "الغاء",
+        "ألغي",
+        "الغي",
+        "إلغي",
+        "cancel",
+    ]
+
+    if (
+        pending
+        and normalized_command
+        in cancel_words
+    ):
+
+        pending_outbound_messages.pop(
+            user_id,
+            None,
+        )
+
+        return (
+            "تم إلغاء إرسال الرسالة ✅"
         )
 
     # =====================================================
@@ -1668,20 +1679,21 @@ async def build_agent_reply(
         ):
 
             return (
-                "رقم الهاتف غير صحيح.\n"
-                "اكتبه بالصيغة الدولية "
-                "من دون مسافات كثيرة.\n\n"
-                "مثال:\n"
-                "97259XXXXXXX"
+                "رقم الهاتف غير صحيح.\n\n"
+                "اكتب الرقم بالصيغة الدولية، مثال:\n"
+                "+9705XXXXXXXX"
             )
 
         if not message_text:
 
             return (
-                "اكتب نص الرسالة التي تريد إرسالها."
+                "لم تكتب نص الرسالة."
             )
 
-        if len(message_text) > 3500:
+        if (
+            len(message_text)
+            > 3500
+        ):
 
             return (
                 "الرسالة طويلة جدًا. "
@@ -1691,21 +1703,32 @@ async def build_agent_reply(
         pending_outbound_messages[
             user_id
         ] = {
-            "to": to_number,
-            "text": message_text,
+            "to":
+                to_number,
+
+            "text":
+                message_text,
         }
+
+        print(
+            "Outbound WhatsApp message pending:",
+            user_id,
+            "to:",
+            to_number,
+        )
 
         return (
             "جاهز للإرسال 📤\n\n"
-            f"إلى: {to_number}\n\n"
-            f"الرسالة:\n{message_text}\n\n"
-            "لن أرسلها الآن.\n"
+            f"إلى: +{to_number}\n\n"
+            "الرسالة:\n"
+            f"{message_text}\n\n"
+            "لم يتم الإرسال بعد.\n\n"
             "اكتب «موافق» للإرسال "
             "أو «إلغاء» لإلغاء العملية."
         )
 
     # =====================================================
-    # Gmail Request
+    # Gmail
     # =====================================================
 
     if is_gmail_request(
@@ -1713,10 +1736,6 @@ async def build_agent_reply(
     ):
 
         try:
-
-            print(
-                "Gmail request detected"
-            )
 
             messages = (
                 await get_gmail_summaries(
@@ -1727,103 +1746,78 @@ async def build_agent_reply(
             if not messages:
 
                 return (
-                    "لم أجد رسائل في Gmail حالياً."
+                    "لم أجد رسائل في Gmail."
                 )
 
-            message_blocks = []
+            blocks = []
 
-            for index, message in enumerate(
+            for index, item in enumerate(
                 messages,
                 start=1,
             ):
 
-                message_blocks.append(
+                blocks.append(
                     (
-                        f"رسالة رقم {index}\n"
+                        f"رسالة {index}\n"
                         f"المرسل: "
-                        f"{message.get('from', '')}\n"
+                        f"{item.get('from', '')}\n"
                         f"العنوان: "
-                        f"{message.get('subject', '')}\n"
+                        f"{item.get('subject', '')}\n"
                         f"التاريخ: "
-                        f"{message.get('date', '')}\n"
+                        f"{item.get('date', '')}\n"
                         f"المقتطف: "
-                        f"{message.get('snippet', '')}"
+                        f"{item.get('snippet', '')}"
                     )
                 )
 
-            gmail_context = "\n\n".join(
-                message_blocks
+            gmail_context = (
+                "\n\n".join(
+                    blocks
+                )
             )
 
-            conversation_context = ""
-
-            if user_id:
-
-                conversation_context = (
-                    await build_conversation_context(
-                        user_id
-                    )
+            memory_context = (
+                await build_conversation_context(
+                    user_id
                 )
+                if user_id
+                else ""
+            )
 
             prompt = f"""
-أنت مساعد أمير الشخصي.
+أنت وكيل أمير الشخصي.
 
-طلب المستخدم الحالي:
+طلب المستخدم:
 {user_message}
 
-هذه بيانات حقيقية تم جلبها الآن مباشرة من Gmail:
-
+هذه رسائل Gmail الحقيقية التي تم جلبها الآن:
 {gmail_context}
 
-سجل المحادثة السابق إن وجد:
-{conversation_context}
+المحادثة السابقة:
+{memory_context}
 
-تعليمات مهمة جداً:
-
-- بيانات الرسائل أعلاه جاءت فعلياً من Gmail.
-- لا تقل إنك لا تستطيع الوصول إلى Gmail.
-- لا تخترع أي رسالة أو مرسل أو عنوان.
-- لا ترسل أي بريد.
-- لا ترد على أي بريد.
-- لا تحذف أي بريد.
-- لا تعدل أي بريد.
+التعليمات:
+- استخدم فقط رسائل Gmail الموجودة أعلاه.
+- لا تخترع معلومات.
+- لا ترسل بريدًا.
+- لا تحذف بريدًا.
+- لا تعدل بريدًا.
 - Gmail للقراءة فقط.
-- إذا طلب المستخدم آخر رسالتين فقط، اعرض رسالتين فقط.
-- إذا طلب أسماء المرسلين والعناوين فقط، لا تعرض المقتطفات.
-- إذا طلب ملخصاً، لخّص الرسائل الموجودة فقط.
-- أجب بالعربية بشكل واضح ومختصر.
+- إذا طلب آخر رسالتين، اعرض رسالتين فقط.
+- إذا طلب اسم المرسل والعنوان فقط، لا تضف تفاصيل أخرى.
+- أجب بالعربية وباختصار.
 """
 
             reply = await run_agent(
                 prompt
             )
 
-            if not reply:
+            if reply:
 
-                return (
-                    "تم جلب رسائل Gmail، "
-                    "لكن تعذر إنشاء الملخص."
-                )
-
-            return reply
-
-        except HTTPException as exc:
-
-            print(
-                "Gmail HTTP error:",
-                exc.status_code,
-            )
-
-            if exc.status_code == 401:
-
-                return (
-                    "تعذر الوصول إلى Gmail حالياً. "
-                    "قد تحتاج إلى إعادة ربط حساب Google."
-                )
+                return reply
 
             return (
-                "حدث خطأ أثناء قراءة Gmail. "
-                "حاول مرة أخرى بعد قليل."
+                "تم جلب Gmail ولكن تعذر إنشاء الرد."
             )
 
         except Exception as exc:
@@ -1835,98 +1829,94 @@ async def build_agent_reply(
 
             return (
                 "حدث خطأ أثناء فحص Gmail. "
-                "لم يتم إرسال أو حذف أو تعديل أي بريد."
+                "لم يتم إرسال أو حذف أي بريد."
             )
 
     # =====================================================
-    # Normal Conversation
+    # Normal AI conversation
     # =====================================================
 
     try:
 
-        conversation_context = ""
+        context = ""
 
         if user_id:
 
-            conversation_context = (
+            context = (
                 await build_conversation_context(
                     user_id
                 )
             )
 
-        if conversation_context:
+        prompt = f"""
+أنت وكيل أمير الشخصي.
 
-            prompt = f"""
-أنت مساعد أمير الشخصي.
+المحادثة السابقة:
+{context}
 
-سجل المحادثة السابق:
-{conversation_context}
-
-رسالة المستخدم الحالية:
+رسالة أمير الحالية:
 {user_message}
 
-تعليمات:
-- أجب بالعربية بشكل طبيعي وواضح.
-- لا تدّع أنك أرسلت رسالة WhatsApp ما لم يتم تنفيذ الإرسال فعلياً.
-- إذا أراد المستخدم إرسال رسالة لشخص، اطلب منه استخدام:
-  أرسل إلى رقم_الهاتف رسالة: نص الرسالة
-- إرسال الرسائل يتطلب تأكيد المستخدم قبل التنفيذ.
+تعليمات مهمة:
+- أجب بالعربية.
+- إذا طلب إرسال رسالة WhatsApp، يجب ألا تدّعي أنك أرسلتها.
+- طريقة الإرسال الصحيحة هي:
+  أرسل إلى +رقم_الهاتف رسالة: نص الرسالة
+- بعد ذلك يجب أخذ تأكيد المستخدم.
+- لا تقل إنك لا تستطيع إرسال WhatsApp بشكل عام، لأن النظام يدعم الإرسال عند استخدام صيغة الأمر الصحيحة.
 """
 
-            return await run_agent(
-                prompt
-            )
+        reply = await run_agent(
+            prompt
+        )
 
-        return await run_agent(
-            user_message
+        return (
+            reply
+            or "تعذر إنشاء الرد."
         )
 
     except Exception as exc:
 
         print(
-            "Agent reply error:",
+            "Agent error:",
             repr(exc),
         )
 
         return (
-            "حدث خطأ مؤقت أثناء معالجة طلبك. "
-            "حاول مرة أخرى."
+            "حدث خطأ مؤقت أثناء معالجة طلبك."
         )
 
 
 # =========================================================
-# Chat API
+# Chat endpoint
 # =========================================================
 
-@app.post(
-    "/chat"
-)
+@app.post("/chat")
 async def chat(
     request: ChatRequest,
 ):
 
-    user_message = (
-        request.message.strip()
+    text = (
+        request.message
+        .strip()
     )
 
-    if not user_message:
+    if not text:
 
         raise HTTPException(
             status_code=400,
-            detail=(
-                "Message is required"
-            ),
+            detail="Message is required",
         )
 
     answer = await build_agent_reply(
-        user_message,
+        text,
         "web-user",
     )
 
     await save_memory(
         "web-user",
         "user",
-        user_message,
+        text,
     )
 
     await save_memory(
@@ -1936,12 +1926,13 @@ async def chat(
     )
 
     return {
-        "reply": answer,
+        "reply":
+            answer
     }
 
 
 # =========================================================
-# WhatsApp Background Processing
+# WhatsApp message processor
 # =========================================================
 
 async def process_whatsapp_message(
@@ -1959,9 +1950,11 @@ async def process_whatsapp_message(
             sender,
         )
 
-        answer = await build_agent_reply(
-            text,
-            sender,
+        answer = (
+            await build_agent_reply(
+                text,
+                sender,
+            )
         )
 
         await save_memory(
@@ -1976,6 +1969,7 @@ async def process_whatsapp_message(
             answer,
         )
 
+        # This sends the agent's reply back to Amir.
         await send_whatsapp_message(
             sender,
             answer,
@@ -1988,23 +1982,9 @@ async def process_whatsapp_message(
             repr(exc),
         )
 
-        try:
-
-            await send_whatsapp_message(
-                sender,
-                (
-                    "حدث خطأ أثناء معالجة طلبك. "
-                    "حاول مرة أخرى بعد قليل."
-                ),
-            )
-
-        except Exception:
-
-            pass
-
 
 # =========================================================
-# WhatsApp Verification
+# WhatsApp Webhook Verification
 # =========================================================
 
 @app.get(
@@ -2014,172 +1994,28 @@ def verify_whatsapp_webhook(
     request: Request,
 ):
 
-    params = request.query_params
-
-    mode = params.get(
-        "hub.mode"
+    mode = (
+        request.query_params
+        .get(
+            "hub.mode"
+        )
     )
 
-    token = params.get(
-        "hub.verify_token"
+    token = (
+        request.query_params
+        .get(
+            "hub.verify_token"
+        )
     )
 
-    challenge = params.get(
-        "hub.challenge"
+    challenge = (
+        request.query_params
+        .get(
+            "hub.challenge"
+        )
     )
 
     if (
         mode == "subscribe"
-        and token == WHATSAPP_VERIFY_TOKEN
-    ):
-
-        return PlainTextResponse(
-            challenge or ""
-        )
-
-    raise HTTPException(
-        status_code=403,
-        detail=(
-            "Verification failed"
-        ),
-    )
-
-
-# =========================================================
-# WhatsApp Webhook
-# =========================================================
-
-@app.post(
-    "/whatsapp/webhook"
-)
-async def whatsapp_webhook(
-    request: Request,
-    background_tasks: BackgroundTasks,
-):
-
-    try:
-
-        payload = await request.json()
-
-        entries = payload.get(
-            "entry",
-            [],
-        )
-
-        for entry in entries:
-
-            changes = entry.get(
-                "changes",
-                [],
-            )
-
-            for change in changes:
-
-                value = change.get(
-                    "value",
-                    {},
-                )
-
-                messages = value.get(
-                    "messages",
-                    [],
-                )
-
-                if not messages:
-
-                    continue
-
-                for message in messages:
-
-                    if (
-                        message.get(
-                            "type"
-                        )
-                        != "text"
-                    ):
-
-                        continue
-
-                    message_id = message.get(
-                        "id",
-                        "",
-                    )
-
-                    if (
-                        message_id
-                        and not remember_whatsapp_message(
-                            message_id
-                        )
-                    ):
-
-                        print(
-                            "Duplicate WhatsApp "
-                            "message ignored:",
-                            message_id,
-                        )
-
-                        continue
-
-                    sender = message.get(
-                        "from",
-                        "",
-                    )
-
-                    text = (
-                        message
-                        .get(
-                            "text",
-                            {},
-                        )
-                        .get(
-                            "body",
-                            "",
-                        )
-                        .strip()
-                    )
-
-                    if not sender:
-
-                        continue
-
-                    if not text:
-
-                        continue
-
-                    background_tasks.add_task(
-                        process_whatsapp_message,
-                        sender,
-                        text,
-                        message_id,
-                    )
-
-    except Exception as exc:
-
-        print(
-            "WhatsApp webhook error:",
-            repr(exc),
-        )
-
-    return {
-        "status": "received"
-    }
-
-
-# =========================================================
-# Local / Render
-# =========================================================
-
-if __name__ == "__main__":
-
-    import uvicorn
-
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=int(
-            os.getenv(
-                "PORT",
-                "8000",
-            )
-        ),
-    )
+        and token
+        ==
