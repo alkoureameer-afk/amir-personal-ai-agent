@@ -1932,90 +1932,166 @@ async def chat(
 
 
 # =========================================================
-# WhatsApp message processor
-# =========================================================
-
-async def process_whatsapp_message(
-    sender: str,
-    text: str,
-    message_id: str,
-):
-
-    try:
-
-        print(
-            "Processing WhatsApp message:",
-            message_id,
-            "from:",
-            sender,
-        )
-
-        answer = (
-            await build_agent_reply(
-                text,
-                sender,
-            )
-        )
-
-        await save_memory(
-            sender,
-            "user",
-            text,
-        )
-
-        await save_memory(
-            sender,
-            "assistant",
-            answer,
-        )
-
-        # This sends the agent's reply back to Amir.
-        await send_whatsapp_message(
-            sender,
-            answer,
-        )
-
-    except Exception as exc:
-
-        print(
-            "WhatsApp processing error:",
-            repr(exc),
-        )
-
-
-# =========================================================
 # WhatsApp Webhook Verification
 # =========================================================
 
-@app.get(
-    "/whatsapp/webhook"
-)
+@app.get("/whatsapp/webhook")
 def verify_whatsapp_webhook(
     request: Request,
 ):
 
-    mode = (
-        request.query_params
-        .get(
-            "hub.mode"
-        )
+    mode = request.query_params.get(
+        "hub.mode"
     )
 
-    token = (
-        request.query_params
-        .get(
-            "hub.verify_token"
-        )
+    token = request.query_params.get(
+        "hub.verify_token"
     )
 
-    challenge = (
-        request.query_params
-        .get(
-            "hub.challenge"
-        )
+    challenge = request.query_params.get(
+        "hub.challenge"
     )
 
     if (
         mode == "subscribe"
-        and token
-        ==
+        and token == WHATSAPP_VERIFY_TOKEN
+    ):
+
+        return PlainTextResponse(
+            challenge or ""
+        )
+
+    raise HTTPException(
+        status_code=403,
+        detail="Verification failed",
+    )
+
+
+# =========================================================
+# WhatsApp Webhook Receiver
+# =========================================================
+
+@app.post("/whatsapp/webhook")
+async def whatsapp_webhook(
+    request: Request,
+    background_tasks: BackgroundTasks,
+):
+
+    try:
+
+        payload = await request.json()
+
+        entries = payload.get(
+            "entry",
+            [],
+        )
+
+        for entry in entries:
+
+            changes = entry.get(
+                "changes",
+                [],
+            )
+
+            for change in changes:
+
+                value = change.get(
+                    "value",
+                    {},
+                )
+
+                messages = value.get(
+                    "messages",
+                    [],
+                )
+
+                for message in messages:
+
+                    if (
+                        message.get("type")
+                        != "text"
+                    ):
+
+                        continue
+
+                    message_id = message.get(
+                        "id",
+                        "",
+                    )
+
+                    if (
+                        message_id
+                        and not remember_whatsapp_message(
+                            message_id
+                        )
+                    ):
+
+                        print(
+                            "Duplicate WhatsApp message ignored:",
+                            message_id,
+                        )
+
+                        continue
+
+                    sender = message.get(
+                        "from",
+                        "",
+                    )
+
+                    text = (
+                        message
+                        .get(
+                            "text",
+                            {},
+                        )
+                        .get(
+                            "body",
+                            "",
+                        )
+                        .strip()
+                    )
+
+                    if (
+                        not sender
+                        or not text
+                    ):
+
+                        continue
+
+                    background_tasks.add_task(
+                        process_whatsapp_message,
+                        sender,
+                        text,
+                        message_id,
+                    )
+
+    except Exception as exc:
+
+        print(
+            "WhatsApp webhook error:",
+            repr(exc),
+        )
+
+    return {
+        "status": "received"
+    }
+
+
+# =========================================================
+# Run
+# =========================================================
+
+if __name__ == "__main__":
+
+    import uvicorn
+
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=int(
+            os.getenv(
+                "PORT",
+                "8000",
+            )
+        ),
+    )
