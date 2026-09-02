@@ -1,4 +1,5 @@
 import os
+import re
 import secrets
 from collections import deque
 from email.header import decode_header
@@ -88,6 +89,82 @@ GMAIL_SCOPE = (
 pending_states = set()
 
 google_tokens = {}
+
+
+# =========================================================
+# Pending WhatsApp outbound messages
+# =========================================================
+
+pending_outbound_messages = {}
+
+
+def normalize_phone_number(
+    phone: str,
+) -> str:
+
+    return re.sub(
+        r"\D",
+        "",
+        phone or "",
+    )
+
+
+def parse_whatsapp_send_command(
+    text: str,
+):
+
+    text = text.strip()
+
+    patterns = [
+        (
+            r"^(?:أرسل|ارسل)\s+إلى\s+"
+            r"(\+?\d[\d\s\-]+)\s+"
+            r"(?:رسالة\s*)?[:：]\s*(.+)$"
+        ),
+
+        (
+            r"^(?:أرسل|ارسل)\s+الى\s+"
+            r"(\+?\d[\d\s\-]+)\s+"
+            r"(?:رسالة\s*)?[:：]\s*(.+)$"
+        ),
+
+        (
+            r"^(?:أرسل|ارسل)\s+ل(?:ـ)?\s*"
+            r"(\+?\d[\d\s\-]+)\s+"
+            r"(?:رسالة\s*)?[:：]?\s*(.+)$"
+        ),
+    ]
+
+    for pattern in patterns:
+
+        match = re.match(
+            pattern,
+            text,
+            flags=(
+                re.IGNORECASE
+                | re.DOTALL
+            ),
+        )
+
+        if match:
+
+            phone = normalize_phone_number(
+                match.group(1)
+            )
+
+            message = (
+                match.group(2)
+                .strip()
+            )
+
+            if phone and message:
+
+                return (
+                    phone,
+                    message,
+                )
+
+    return None
 
 
 # =========================================================
@@ -457,6 +534,11 @@ def health():
         "gmail_refresh_token_configured": bool(
             GOOGLE_REFRESH_TOKEN
         ),
+
+        "whatsapp_configured": bool(
+            WHATSAPP_ACCESS_TOKEN
+            and WHATSAPP_PHONE_NUMBER_ID
+        ),
     }
 
 
@@ -513,7 +595,7 @@ def privacy():
 
         <p>
             يستخدم التطبيق WhatsApp Cloud API
-            لاستقبال والرد على الرسائل.
+            لاستقبال وإرسال الرسائل.
         </p>
 
         <p>
@@ -798,9 +880,6 @@ async def refresh_access_token() -> str:
         )
 
     if response.status_code != 200:
-
-        # Do not print the complete Google response
-        # because it may contain sensitive details.
 
         print(
             "Google token refresh failed:",
@@ -1107,9 +1186,11 @@ async def gmail_status():
 
             return {
                 "connected": False,
+
                 "status_code": (
                     response.status_code
                 ),
+
                 "persistent_refresh_token": bool(
                     GOOGLE_REFRESH_TOKEN
                 ),
@@ -1133,6 +1214,7 @@ async def gmail_status():
 
         return {
             "connected": False,
+
             "error": exc.detail,
 
             "persistent_refresh_token": bool(
@@ -1149,6 +1231,7 @@ async def gmail_status():
 
         return {
             "connected": False,
+
             "error": (
                 "Gmail status check failed"
             ),
@@ -1181,6 +1264,7 @@ async def get_gmail_summaries(
             "https://gmail.googleapis.com/"
             "gmail/v1/users/me/messages"
         ),
+
         params={
             "maxResults": limit,
         },
@@ -1228,6 +1312,7 @@ async def get_gmail_summaries(
                 "gmail/v1/users/me/messages/"
                 + message_id
             ),
+
             params={
                 "format": "metadata",
 
@@ -1364,6 +1449,103 @@ def is_gmail_request(
 
 
 # =========================================================
+# Send WhatsApp Message
+# =========================================================
+
+async def send_whatsapp_message(
+    to: str,
+    text: str,
+):
+
+    if (
+        not WHATSAPP_ACCESS_TOKEN
+        or not WHATSAPP_PHONE_NUMBER_ID
+    ):
+
+        print(
+            "WhatsApp is not configured"
+        )
+
+        return False
+
+    if not text:
+
+        text = (
+            "تعذر إنشاء الرد."
+        )
+
+    to = normalize_phone_number(
+        to
+    )
+
+    url = (
+        "https://graph.facebook.com/v20.0/"
+        + WHATSAPP_PHONE_NUMBER_ID
+        + "/messages"
+    )
+
+    headers = {
+        "Authorization": (
+            "Bearer "
+            + WHATSAPP_ACCESS_TOKEN
+        ),
+
+        "Content-Type": (
+            "application/json"
+        ),
+    }
+
+    payload = {
+        "messaging_product": "whatsapp",
+
+        "to": to,
+
+        "type": "text",
+
+        "text": {
+            "body": text[:4000],
+        },
+    }
+
+    try:
+
+        async with httpx.AsyncClient(
+            timeout=30.0
+        ) as client:
+
+            response = await client.post(
+                url,
+                headers=headers,
+                json=payload,
+            )
+
+        if response.status_code >= 300:
+
+            print(
+                "WhatsApp send error:",
+                response.status_code,
+                response.text[:500],
+            )
+
+            return False
+
+        print(
+            "WhatsApp reply sent successfully"
+        )
+
+        return True
+
+    except Exception as exc:
+
+        print(
+            "WhatsApp send exception:",
+            repr(exc),
+        )
+
+        return False
+
+
+# =========================================================
 # Build Agent Reply
 # =========================================================
 
@@ -1371,6 +1553,156 @@ async def build_agent_reply(
     user_message: str,
     user_id: str = "",
 ) -> str:
+
+    normalized_command = (
+        user_message
+        .strip()
+        .lower()
+    )
+
+    # =====================================================
+    # Confirm pending outgoing WhatsApp message
+    # =====================================================
+
+    if normalized_command in [
+        "موافق",
+        "وافق",
+        "نعم",
+        "نعم أرسل",
+        "نعم ارسل",
+        "تأكيد",
+        "اكد",
+        "أكد",
+        "confirm",
+    ]:
+
+        pending = pending_outbound_messages.get(
+            user_id
+        )
+
+        if pending:
+
+            to_number = pending.get(
+                "to"
+            )
+
+            message_text = pending.get(
+                "text"
+            )
+
+            success = (
+                await send_whatsapp_message(
+                    to_number,
+                    message_text,
+                )
+            )
+
+            if success:
+
+                pending_outbound_messages.pop(
+                    user_id,
+                    None,
+                )
+
+                return (
+                    "تم إرسال الرسالة بنجاح ✅\n\n"
+                    f"إلى: {to_number}"
+                )
+
+            return (
+                "تعذر إرسال الرسالة عبر WhatsApp. "
+                "لم يتم حذف طلب الإرسال.\n\n"
+                "اكتب «موافق» للمحاولة مرة أخرى "
+                "أو «إلغاء» لإلغاء العملية."
+            )
+
+    # =====================================================
+    # Cancel pending outgoing WhatsApp message
+    # =====================================================
+
+    if normalized_command in [
+        "إلغاء",
+        "الغاء",
+        "ألغي",
+        "الغي",
+        "إلغي",
+        "cancel",
+    ]:
+
+        if (
+            user_id
+            in pending_outbound_messages
+        ):
+
+            pending_outbound_messages.pop(
+                user_id,
+                None,
+            )
+
+            return (
+                "تم إلغاء إرسال الرسالة ✅"
+            )
+
+        return (
+            "لا توجد رسالة معلقة للإرسال."
+        )
+
+    # =====================================================
+    # New outbound WhatsApp request
+    # =====================================================
+
+    outbound = parse_whatsapp_send_command(
+        user_message
+    )
+
+    if outbound:
+
+        (
+            to_number,
+            message_text,
+        ) = outbound
+
+        if (
+            len(to_number) < 8
+            or len(to_number) > 15
+        ):
+
+            return (
+                "رقم الهاتف غير صحيح.\n"
+                "اكتبه بالصيغة الدولية "
+                "من دون مسافات كثيرة.\n\n"
+                "مثال:\n"
+                "97259XXXXXXX"
+            )
+
+        if not message_text:
+
+            return (
+                "اكتب نص الرسالة التي تريد إرسالها."
+            )
+
+        if len(message_text) > 3500:
+
+            return (
+                "الرسالة طويلة جدًا. "
+                "اختصرها ثم حاول مرة أخرى."
+            )
+
+        pending_outbound_messages[
+            user_id
+        ] = {
+            "to": to_number,
+            "text": message_text,
+        }
+
+        return (
+            "جاهز للإرسال 📤\n\n"
+            f"إلى: {to_number}\n\n"
+            f"الرسالة:\n{message_text}\n\n"
+            "لن أرسلها الآن.\n"
+            "اكتب «موافق» للإرسال "
+            "أو «إلغاء» لإلغاء العملية."
+        )
 
     # =====================================================
     # Gmail Request
@@ -1533,7 +1865,12 @@ async def build_agent_reply(
 رسالة المستخدم الحالية:
 {user_message}
 
-أجب بالعربية بشكل طبيعي وواضح.
+تعليمات:
+- أجب بالعربية بشكل طبيعي وواضح.
+- لا تدّع أنك أرسلت رسالة WhatsApp ما لم يتم تنفيذ الإرسال فعلياً.
+- إذا أراد المستخدم إرسال رسالة لشخص، اطلب منه استخدام:
+  أرسل إلى رقم_الهاتف رسالة: نص الرسالة
+- إرسال الرسائل يتطلب تأكيد المستخدم قبل التنفيذ.
 """
 
             return await run_agent(
@@ -1604,87 +1941,6 @@ async def chat(
 
 
 # =========================================================
-# Send WhatsApp Message
-# =========================================================
-
-async def send_whatsapp_message(
-    to: str,
-    text: str,
-):
-
-    if (
-        not WHATSAPP_ACCESS_TOKEN
-        or not WHATSAPP_PHONE_NUMBER_ID
-    ):
-
-        print(
-            "WhatsApp is not configured"
-        )
-
-        return False
-
-    if not text:
-
-        text = (
-            "تعذر إنشاء الرد."
-        )
-
-    url = (
-        "https://graph.facebook.com/v20.0/"
-        + WHATSAPP_PHONE_NUMBER_ID
-        + "/messages"
-    )
-
-    headers = {
-        "Authorization": (
-            "Bearer "
-            + WHATSAPP_ACCESS_TOKEN
-        ),
-
-        "Content-Type": (
-            "application/json"
-        ),
-    }
-
-    payload = {
-        "messaging_product": "whatsapp",
-
-        "to": to,
-
-        "type": "text",
-
-        "text": {
-            "body": text[:4000],
-        },
-    }
-
-    async with httpx.AsyncClient(
-        timeout=30.0
-    ) as client:
-
-        response = await client.post(
-            url,
-            headers=headers,
-            json=payload,
-        )
-
-    if response.status_code >= 300:
-
-        print(
-            "WhatsApp send error:",
-            response.status_code,
-        )
-
-        return False
-
-    print(
-        "WhatsApp reply sent successfully"
-    )
-
-    return True
-
-
-# =========================================================
 # WhatsApp Background Processing
 # =========================================================
 
@@ -1699,6 +1955,8 @@ async def process_whatsapp_message(
         print(
             "Processing WhatsApp message:",
             message_id,
+            "from:",
+            sender,
         )
 
         answer = await build_agent_reply(
@@ -1729,9 +1987,6 @@ async def process_whatsapp_message(
             "WhatsApp processing error:",
             repr(exc),
         )
-
-        # Always try to return a useful error message
-        # instead of leaving the user without a reply.
 
         try:
 
@@ -1905,7 +2160,6 @@ async def whatsapp_webhook(
             repr(exc),
         )
 
-    # Return quickly to Meta
     return {
         "status": "received"
     }
