@@ -1679,6 +1679,21 @@ async def whatsapp_webhook(
                     {},
                 )
 
+statuses = value.get(
+    "statuses",
+    [],
+)
+
+for status in statuses:
+
+    print(
+        "WHATSAPP DELIVERY STATUS:",
+        status.get("id"),
+        status.get("status"),
+        status.get("recipient_id"),
+        status.get("errors"),
+    )
+    
                 messages = value.get(
                     "messages",
                     [],
